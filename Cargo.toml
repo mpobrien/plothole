@@ -1,0 +1,11 @@
+[package]
+name = "axirust"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lazy_static = "1.5.0"
+num-traits = "0.2.19"
+piet = "0.8.0"
+piet-common = "0.8.0"
+piet-svg = "0.8.0"
