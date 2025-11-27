@@ -47,7 +47,7 @@ fn main() {
 }
 
 fn render_text(text: &str, font_name: &str) {
-    let font = hershey::get_by_name(font_name).expect("unknown font name");
+    let font = hershey::fonts().get(&font_name.to_uppercase() as &str).expect("unknown font name");
     let drawing = Drawing::new(text_to_paths(text, &font));
     let bounds = drawing.bounding_box();
     let size = bounds.size();
