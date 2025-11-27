@@ -1,6 +1,7 @@
 pub mod font;
 mod hershey;
 use num_traits::{Num, Signed, Zero};
+use std::collections::HashMap;
 use std::ops::Add;
 use std::ops::Mul;
 use std::ops::Neg;
@@ -16,26 +17,48 @@ use piet::{
 use piet_common::Device;
 use piet_svg::RenderContext as SvgRenderContext;
 
+use clap::{Parser, Subcommand};
+
+#[derive(Parser, Debug)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Render text using a given font
+    RenderText {
+        #[arg(short, long)]
+        text: String,
+
+        #[arg(short, long)]
+        font_name: String,
+    },
+}
+
 fn main() {
-    println!("foo {:?}", *hershey::ASTROLOGY);
-    println!("Hello, world!");
+    let cli = Cli::parse();
+    match cli.command {
+        Commands::RenderText { text, font_name } => {
+            render_text(&text, &font_name);
+        }
+    }
+}
+
+fn render_text(text: &str, font_name: &str) {
+    let font = hershey::get_by_name(font_name).expect("unknown font name");
+    let drawing = Drawing::new(text_to_paths(text, &font));
+    let bounds = drawing.bounding_box();
+    let size = bounds.size();
 
     // Create an SVG render context with the given size
-    let mut rc = SvgRenderContext::new(Size::new(100.0, 100.0));
-
-    // let mut device = Device::new().unwrap();
-    // let mut target = device.bitmap_target(100, 100, 1.0).unwrap();
-    //
-    let drawing = Drawing::new(text("hello world", &hershey::ASTROLOGY));
-    println!("bb: {:?}", drawing.bounding_box());
-    // let mut rc = target.render_context();
+    let mut rc = SvgRenderContext::new(Size::new(size.x, size.y));
     render(&mut rc, &drawing);
-
-    let svg_data = rc.finish().unwrap();
+    rc.finish().unwrap();
     println!("{}", rc.display());
     let out = File::create("out.svg").unwrap();
     rc.write(out).unwrap();
-    // surface.write_to_file("foo.bmp");
 }
 
 fn render(rc: &mut impl RenderContext, drawing: &Drawing<f64>) {
@@ -73,7 +96,7 @@ fn do_stuff(rc: &mut impl RenderContext) {
 
 // Returns a set of paths that will render a string of text
 // using the given font.
-fn text<'a>(input: &str, ft: &'a font::Font) -> Vec<Path<f64>> {
+fn text_to_paths<'a>(input: &str, ft: &'a font::Font) -> Vec<Path<f64>> {
     let spacing = 0;
     let mut x = 0;
     let mut out = vec![];
