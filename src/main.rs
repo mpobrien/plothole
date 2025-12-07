@@ -1,7 +1,7 @@
+pub mod device;
 pub mod font;
 mod hershey;
 use num_traits::{Num, Signed, Zero};
-use std::collections::HashMap;
 use std::ops::Add;
 use std::ops::Mul;
 use std::ops::Neg;
@@ -12,9 +12,8 @@ use std::{fs::File, ops::Deref};
 use font::{Path, Vec2d};
 use piet::{
     Color, RenderContext,
-    kurbo::{Line, Rect, Size},
+    kurbo::{Line, Size},
 };
-use piet_common::Device;
 use piet_svg::RenderContext as SvgRenderContext;
 
 use clap::{Parser, Subcommand};
@@ -47,7 +46,9 @@ fn main() {
 }
 
 fn render_text(text: &str, font_name: &str) {
-    let font = hershey::fonts().get(&font_name.to_uppercase() as &str).expect("unknown font name");
+    let font = hershey::fonts()
+        .get(&font_name.to_uppercase() as &str)
+        .expect("unknown font name");
     let drawing = Drawing::new(text_to_paths(text, &font));
     let bounds = drawing.bounding_box();
     let size = bounds.size();
