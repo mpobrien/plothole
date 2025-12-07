@@ -77,20 +77,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "axirust"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "clap",
- "num-traits",
- "piet",
- "piet-common",
- "piet-svg",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "base64"
 version = "0.13.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1019,6 +1005,20 @@ name = "pkg-config"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
+
+[[package]]
+name = "plothole"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "clap",
+ "num-traits",
+ "piet",
+ "piet-common",
+ "piet-svg",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "png"
