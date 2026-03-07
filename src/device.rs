@@ -25,6 +25,25 @@ pub enum StepMode {
     Full     = 5,
 }
 
+impl StepMode {
+    /// Steps per millimeter for this step mode.
+    ///
+    /// Based on: `STEPS_PER_MM = 80 / 2^(mode - 1)`
+    /// - Step1_16 (mode 1): 80 steps/mm
+    /// - Step1_8  (mode 2): 40 steps/mm
+    /// - Step1_4  (mode 3): 20 steps/mm
+    /// - Step1_2  (mode 4): 10 steps/mm
+    /// - Full     (mode 5):  5 steps/mm
+    pub fn steps_per_mm(self) -> f64 {
+        let divider = 1u32 << (self as u32 - 1);
+        80.0 / divider as f64
+    }
+
+    pub fn mm_to_steps(self, mm: f64) -> i32 {
+        (mm * self.steps_per_mm()).round() as i32
+    }
+}
+
 /// Motor 1 setting for the EM command. Controls both its enable state and the
 /// global step mode (which applies to both motors).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +103,12 @@ pub trait Commander {
     fn pen_up(&mut self)   -> Result<(), Error>;
     fn pen_down(&mut self) -> Result<(), Error>;
     fn move_motors(&mut self, steps_x: i32, steps_y: i32, duration: Duration) -> Result<(), Error>;
+
+    /// Move by `(x_mm, y_mm)` millimeters, converting to steps using `mode`.
+    fn move_mm(&mut self, x_mm: f64, y_mm: f64, duration: Duration, mode: StepMode) -> Result<(), Error> {
+        self.move_motors(mode.mm_to_steps(x_mm), mode.mm_to_steps(y_mm), duration)
+    }
+
     fn raw(&mut self, command: &[&str]) -> Result<String, Error>;
 }
 

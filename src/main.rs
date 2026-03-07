@@ -13,6 +13,22 @@ mod motion;
 mod optimize;
 use optimize::PathOptimizer;
 
+/// Millimetres per drawing unit.
+///
+/// This is the only value that needs calibration. Plot a shape whose size you
+/// know in drawing units, measure it physically, and set:
+///     MM_PER_UNIT = measured_mm / drawing_units
+///
+/// Device resolution background (for reference, not needed here):
+///   The AxiDraw EBB native axes run at 113 steps/mm (SM command, 1/16 mode).
+///   XM is an alias for SM where A→(A+B) and B→(A-B), so Cartesian X and Y
+///   each get √2 fewer native steps, giving 113/√2 ≈ 80 steps/mm — matching
+///   `StepMode::steps_per_mm()` in device.rs. No device calibration needed.
+///
+/// The font-unit → mm scale (this constant) is independent of that and must
+/// be determined from a real plot. Placeholder is 1 typographic point ≈ 0.353 mm.
+const MM_PER_UNIT: f64 = 0.3528;
+
 use std::{fs::File, ops::Deref};
 
 use font::{Path, Vec2d};
@@ -209,6 +225,17 @@ fn inspect(
     let length_drawn: f64 = original.iter().filter(|p| p.pen_down)
         .map(|p| path_length(&p.points)).sum();
 
+    // Bounding box of all pen-down points.
+    let (mut min_x, mut min_y) = (f64::INFINITY, f64::INFINITY);
+    let (mut max_x, mut max_y) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for p in original.iter().filter(|p| p.pen_down) {
+        for &(x, y) in &p.points {
+            min_x = min_x.min(x); max_x = max_x.max(x);
+            min_y = min_y.min(y); max_y = max_y.max(y);
+        }
+    }
+    let (bb_w, bb_h) = (max_x - min_x, max_y - min_y);
+
     // Metrics that differ between orderings.
     let penup_orig: f64 = original.iter().filter(|p| !p.pen_down)
         .map(|p| path_length(&p.points)).sum();
@@ -243,6 +270,12 @@ fn inspect(
 
     println!("Paths:          {} ({} pen-down, {} pen-up)", original.len(), n_pen_down, original.len() - n_pen_down);
     println!("Points:         {}", n_points);
+    let bb_w_mm = bb_w * MM_PER_UNIT;
+    let bb_h_mm = bb_h * MM_PER_UNIT;
+    println!("Bounding box:   {:.1} × {:.1} units  ({:.1} × {:.1} mm  /  {:.2} × {:.2} in)",
+        bb_w, bb_h,
+        bb_w_mm, bb_h_mm,
+        bb_w_mm / 25.4, bb_h_mm / 25.4);
     println!("Length (drawn): {:.1} units", length_drawn);
     println!("Plan time:      {:?}  (vel={}, accel={})", plan_time, profile.maximum_velocity, profile.acceleration);
     println!();
