@@ -152,7 +152,9 @@ fn main() {
                 .get(&font_name.to_uppercase() as &str)
                 .expect("unknown font name");
             let raw = text_to_paths(&text, font);
-            let original = drawing_to_drawn_paths(&Drawing::new(raw.clone()));
+            let original = drawing_to_drawn_paths(&Drawing::new(
+                raw.clone().into_iter().flatten().collect()
+            ));
             let optimized = drawing_to_drawn_paths(&Drawing::new(optimize_path_order(raw)));
             let profile = motion::AccelerationProfile {
                 acceleration,
@@ -166,6 +168,7 @@ fn main() {
                 .get(&font_name.to_uppercase() as &str)
                 .expect("unknown font name");
             let drawing = Drawing::new(optimize_path_order(text_to_paths(&text, font)));
+
             let paths = drawing_to_drawn_paths(&drawing);
             let profile = motion::AccelerationProfile {
                 acceleration,
@@ -267,7 +270,7 @@ fn render_text(text: &str, font_name: &str) {
     let font = hershey::fonts()
         .get(&font_name.to_uppercase() as &str)
         .expect("unknown font name");
-    let drawing = Drawing::new(text_to_paths(text, &font));
+    let drawing = Drawing::new(text_to_paths(text, &font).into_iter().flatten().collect());
     let bounds = drawing.bounding_box();
     let size = bounds.size();
 
@@ -313,36 +316,49 @@ fn do_stuff(rc: &mut impl RenderContext) {
     // rctx.stroke(shape, brush, width);
 }
 
-/// Reorder (and optionally reverse) pen-down paths using a path optimizer,
-/// minimising total pen-up travel from the origin.
-fn optimize_path_order(paths: Vec<Path<f64>>) -> Vec<Path<f64>> {
-    // Drop empty paths — they have no endpoints and Drawing::new skips them anyway.
-    let paths: Vec<Path<f64>> = paths.into_iter().filter(|p| !p.points().is_empty()).collect();
+/// Optimize stroke ordering within each character group independently, then
+/// concatenate groups in character order. The pen position carried into each
+/// group is the exit point of the previous group.
+fn optimize_path_order(grouped: Vec<Vec<Path<f64>>>) -> Vec<Path<f64>> {
+    let mut result = vec![];
+    let mut pen = (0.0f64, 0.0f64);
 
-    let endpoints: Vec<optimize::PathEndpoints> = paths.iter().map(|p| {
-        optimize::PathEndpoints {
-            start: (p.start().x, p.start().y),
-            end:   (p.end().x,   p.end().y),
+    for group in grouped {
+        // Drop empty paths within the group.
+        let paths: Vec<Path<f64>> = group.into_iter()
+            .filter(|p| !p.points().is_empty())
+            .collect();
+        if paths.is_empty() { continue; }
+
+        let endpoints: Vec<optimize::PathEndpoints> = paths.iter().map(|p| {
+            optimize::PathEndpoints {
+                start: (p.start().x, p.start().y),
+                end:   (p.end().x,   p.end().y),
+            }
+        }).collect();
+
+        let order = if endpoints.len() <= optimize::HELD_KARP_LIMIT {
+            optimize::HeldKarp.optimize(&endpoints, pen)
+        } else {
+            optimize::NearestNeighbor.optimize(&endpoints, pen)
+        };
+
+        for o in order {
+            let mut pts = paths[o.index].points().clone();
+            if o.reversed { pts.reverse(); }
+            let last = pts.last().unwrap();
+            pen = (last.x, last.y);
+            result.push(Path::new(pts));
         }
-    }).collect();
+    }
 
-    let origin = (0.0f64, 0.0f64);
-    let order = if endpoints.len() <= optimize::HELD_KARP_LIMIT {
-        optimize::HeldKarp.optimize(&endpoints, origin)
-    } else {
-        optimize::NearestNeighbor.optimize(&endpoints, origin)
-    };
-
-    order.into_iter().map(|o| {
-        let mut pts = paths[o.index].points().clone();
-        if o.reversed { pts.reverse(); }
-        Path::new(pts)
-    }).collect()
+    result
 }
 
 // Returns a set of paths that will render a string of text
 // using the given font.
-fn text_to_paths<'a>(input: &str, ft: &'a font::Font) -> Vec<Path<f64>> {
+// Returns one Vec<Path> per character, preserving glyph grouping.
+fn text_to_paths<'a>(input: &str, ft: &'a font::Font) -> Vec<Vec<Path<f64>>> {
     let spacing = 0;
     let mut x = 0;
     let mut out = vec![];
@@ -350,9 +366,11 @@ fn text_to_paths<'a>(input: &str, ft: &'a font::Font) -> Vec<Path<f64>> {
         let index = (ch as usize) - 32;
         if index > ft.len() {
             x = x + spacing;
+            continue;
         }
         let glyph = &ft[index];
 
+        let mut glyph_paths = vec![];
         for glyph_path in &glyph.paths {
             let mut new_path: Path<f64> = Path::empty();
             for point in glyph_path.points() {
@@ -361,8 +379,9 @@ fn text_to_paths<'a>(input: &str, ft: &'a font::Font) -> Vec<Path<f64>> {
                     y: point.y as f64,
                 });
             }
-            out.push(new_path);
+            glyph_paths.push(new_path);
         }
+        out.push(glyph_paths);
         x = x + glyph.right - glyph.left + spacing
     }
     out
