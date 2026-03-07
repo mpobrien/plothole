@@ -23,3 +23,12 @@ plothole animate --text "the quick brown fox jumps over the lazy dog" --font-nam
 ```
 
 ![Demo](demo.gif)
+
+
+```
+plothole animate --text "Sphinx of black quartz, judge my vow" --font-name music \
+    --max-velocity 400 --acceleration 1500 --cornering 0.5 \
+    --width 1200 --height 300 --output demo2.gif --duration 8
+```
+
+![Demo2](demo2.gif)
