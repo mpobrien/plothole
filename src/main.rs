@@ -10,6 +10,8 @@ use std::ops::Neg;
 use std::ops::Sub;
 
 mod motion;
+mod optimize;
+use optimize::PathOptimizer;
 
 use std::{fs::File, ops::Deref};
 
@@ -70,7 +72,64 @@ enum Commands {
         /// Cornering factor — higher = faster through corners (font units)
         #[arg(long, default_value = "1.0")]
         cornering: f64,
+
+        /// Target animation duration (e.g. "5s", "1m30s", "1h20m5s"). When set,
+        /// the plotter timeline is scaled to fit; omit to use real plotter time.
+        #[arg(long, value_parser = parse_duration)]
+        duration: Option<f64>,
     },
+    /// Run the motion planner and print a summary of the drawing and plan
+    Inspect {
+        #[arg(short, long)]
+        text: String,
+
+        #[arg(short, long)]
+        font_name: String,
+
+        /// Maximum pen velocity (font units/second)
+        #[arg(long, default_value = "500.0")]
+        max_velocity: f64,
+
+        /// Pen acceleration (font units/second²)
+        #[arg(long, default_value = "2000.0")]
+        acceleration: f64,
+
+        /// Cornering factor — higher = faster through corners (font units)
+        #[arg(long, default_value = "1.0")]
+        cornering: f64,
+    },
+}
+
+/// Parse a human-readable duration string into seconds.
+/// Accepts hours (h), minutes (m), and seconds (s) in any combination,
+/// e.g. "5s", "1m", "1m30s", "1h20m5s".
+fn parse_duration(s: &str) -> Result<f64, String> {
+    let mut total = 0.0f64;
+    let mut num = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_digit() || ch == '.' {
+            num.push(ch);
+        } else {
+            if num.is_empty() {
+                return Err(format!("expected number before '{ch}' in \"{s}\""));
+            }
+            let n: f64 = num.parse().map_err(|_| format!("invalid number in \"{s}\""))?;
+            num.clear();
+            match ch {
+                'h' => total += n * 3600.0,
+                'm' => total += n * 60.0,
+                's' => total += n,
+                _ => return Err(format!("unknown unit '{ch}' in \"{s}\" (expected h, m, or s)")),
+            }
+        }
+    }
+    if !num.is_empty() {
+        return Err(format!("trailing number without unit in \"{s}\""));
+    }
+    if total <= 0.0 {
+        return Err(format!("duration must be positive, got \"{s}\""));
+    }
+    Ok(total)
 }
 
 fn main() {
@@ -79,20 +138,106 @@ fn main() {
         Commands::RenderText { text, font_name } => {
             render_text(&text, &font_name);
         }
-        Commands::Animate { text, font_name, output, fps, width, height, max_velocity, acceleration, cornering } => {
+        Commands::Inspect { text, font_name, max_velocity, acceleration, cornering } => {
             let font = hershey::fonts()
                 .get(&font_name.to_uppercase() as &str)
                 .expect("unknown font name");
-            let drawing = Drawing::new(text_to_paths(&text, font));
+            let raw = text_to_paths(&text, font);
+            let original = drawing_to_drawn_paths(&Drawing::new(raw.clone()));
+            let optimized = drawing_to_drawn_paths(&Drawing::new(optimize_path_order(raw)));
+            let profile = motion::AccelerationProfile {
+                acceleration,
+                maximum_velocity: max_velocity,
+                cornering_factor: cornering,
+            };
+            inspect(&original, &optimized, &profile);
+        }
+        Commands::Animate { text, font_name, output, fps, width, height, max_velocity, acceleration, cornering, duration } => {
+            let font = hershey::fonts()
+                .get(&font_name.to_uppercase() as &str)
+                .expect("unknown font name");
+            let drawing = Drawing::new(optimize_path_order(text_to_paths(&text, font)));
             let paths = drawing_to_drawn_paths(&drawing);
             let profile = motion::AccelerationProfile {
                 acceleration,
                 maximum_velocity: max_velocity,
                 cornering_factor: cornering,
             };
-            animate::animate_planned(&paths, &profile, &output, width, height, fps)
+            animate::animate_planned(&paths, &profile, &output, width, height, fps, duration)
                 .expect("animation failed");
         }
+    }
+}
+
+fn path_length(points: &[(f64, f64)]) -> f64 {
+    points.windows(2).map(|w| {
+        let (x1, y1) = w[0];
+        let (x2, y2) = w[1];
+        ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt()
+    }).sum()
+}
+
+fn plan_duration(paths: &[animate::DrawnPath], profile: &motion::AccelerationProfile) -> f64 {
+    paths.iter().filter(|p| p.points.len() >= 2).map(|p| {
+        let vec2d: Vec<motion::Vec2d> = p.points.iter()
+            .map(|&(x, y)| motion::Vec2d::new(x, y))
+            .collect();
+        motion::plan_path(&vec2d, profile).duration()
+    }).sum()
+}
+
+fn inspect(
+    original: &[animate::DrawnPath],
+    optimized: &[animate::DrawnPath],
+    profile: &motion::AccelerationProfile,
+) {
+    // Fixed metrics (same for both orderings).
+    let n_pen_down = original.iter().filter(|p| p.pen_down).count();
+    let n_points: usize = original.iter().map(|p| p.points.len()).sum();
+    let length_drawn: f64 = original.iter().filter(|p| p.pen_down)
+        .map(|p| path_length(&p.points)).sum();
+
+    // Metrics that differ between orderings.
+    let penup_orig: f64 = original.iter().filter(|p| !p.pen_down)
+        .map(|p| path_length(&p.points)).sum();
+    let penup_opt: f64  = optimized.iter().filter(|p| !p.pen_down)
+        .map(|p| path_length(&p.points)).sum();
+
+    let total_orig = length_drawn + penup_orig;
+    let total_opt  = length_drawn + penup_opt;
+
+    let t0 = std::time::Instant::now();
+    let time_orig = plan_duration(original, profile);
+    let time_opt  = plan_duration(optimized, profile);
+    let plan_time = t0.elapsed();
+
+    let optimizer_name = if n_pen_down <= optimize::HELD_KARP_LIMIT {
+        "Held-Karp (exact)"
+    } else {
+        "NearestNeighbor (greedy)"
+    };
+
+    // Format each cell as a string first so we can measure widths.
+    let rows: Vec<(&str, String, String, f64)> = vec![
+        ("Pen-up length:", format!("{:.1} units", penup_orig), format!("{:.1} units", penup_opt), (penup_opt - penup_orig) / penup_orig * 100.0),
+        ("Total length:",  format!("{:.1} units", total_orig), format!("{:.1} units", total_opt),  (total_opt  - total_orig)  / total_orig  * 100.0),
+        ("Plotter time:",  format!("{:.2} s",     time_orig),  format!("{:.2} s",     time_opt),   (time_opt   - time_orig)   / time_orig   * 100.0),
+    ];
+
+    let lw = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
+    let c1 = "Original".len().max(rows.iter().map(|r| r.1.len()).max().unwrap_or(0));
+    let c2 = optimizer_name.len().max(rows.iter().map(|r| r.2.len()).max().unwrap_or(0));
+    let cw = "Change".len().max(7); // "+100.0%"
+
+    println!("Paths:          {} ({} pen-down, {} pen-up)", original.len(), n_pen_down, original.len() - n_pen_down);
+    println!("Points:         {}", n_points);
+    println!("Length (drawn): {:.1} units", length_drawn);
+    println!("Plan time:      {:?}  (vel={}, accel={})", plan_time, profile.maximum_velocity, profile.acceleration);
+    println!();
+    println!("{:<lw$}  {:>c1$}  {:>c2$}  {:>cw$}", "", "Original", optimizer_name, "Change");
+    println!("{}", "-".repeat(lw + 2 + c1 + 2 + c2 + 2 + cw));
+    for (label, v1, v2, pct) in &rows {
+        println!("{:<lw$}  {:>c1$}  {:>c2$}  {:>+cw$.1}%", label, v1, v2, pct);
     }
 }
 
@@ -157,6 +302,33 @@ fn do_stuff(rc: &mut impl RenderContext) {
     rc.stroke(Line::new((10.0, 10.0), (100.0, 50.0)), &Color::BLUE, 1.0);
     rc.finish().unwrap();
     // rctx.stroke(shape, brush, width);
+}
+
+/// Reorder (and optionally reverse) pen-down paths using a path optimizer,
+/// minimising total pen-up travel from the origin.
+fn optimize_path_order(paths: Vec<Path<f64>>) -> Vec<Path<f64>> {
+    // Drop empty paths — they have no endpoints and Drawing::new skips them anyway.
+    let paths: Vec<Path<f64>> = paths.into_iter().filter(|p| !p.points().is_empty()).collect();
+
+    let endpoints: Vec<optimize::PathEndpoints> = paths.iter().map(|p| {
+        optimize::PathEndpoints {
+            start: (p.start().x, p.start().y),
+            end:   (p.end().x,   p.end().y),
+        }
+    }).collect();
+
+    let origin = (0.0f64, 0.0f64);
+    let order = if endpoints.len() <= optimize::HELD_KARP_LIMIT {
+        optimize::HeldKarp.optimize(&endpoints, origin)
+    } else {
+        optimize::NearestNeighbor.optimize(&endpoints, origin)
+    };
+
+    order.into_iter().map(|o| {
+        let mut pts = paths[o.index].points().clone();
+        if o.reversed { pts.reverse(); }
+        Path::new(pts)
+    }).collect()
 }
 
 // Returns a set of paths that will render a string of text

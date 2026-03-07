@@ -4,6 +4,7 @@ use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke as SkiaStrok
 use crate::motion::{self, AccelerationProfile, Vec2d};
 
 /// A sequence of points to be drawn with the pen either up or down.
+#[derive(Clone)]
 pub struct DrawnPath {
     pub points: Vec<(f64, f64)>,
     pub pen_down: bool,
@@ -152,6 +153,7 @@ pub fn animate_planned(
     width: u32,
     height: u32,
     fps: u32,
+    target_duration: Option<f64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (min_x, min_y, max_x, max_y) = bounding_box(paths).ok_or("empty drawing")?;
 
@@ -208,14 +210,18 @@ pub fn animate_planned(
         current_time += duration;
     }
 
-    let total_duration = current_time;
-    let total_frames = (total_duration * fps as f64).ceil() as u32 + 1;
+    let plotter_duration = current_time;
+    // If a target duration was given, scale plotter time to fit; otherwise run at real speed.
+    let anim_duration = target_duration.unwrap_or(plotter_duration);
+    let time_scale = plotter_duration / anim_duration;
+    let total_frames = (anim_duration * fps as f64).ceil() as u32 + 1;
     let frame_delay = (100.0 / fps as f64).round() as u16;
 
     let frames: Vec<gif::Frame<'static>> = (0..total_frames)
         .into_par_iter()
         .map(|frame_i| {
-            let t = frame_i as f64 / fps as f64;
+            // Convert animation time → plotter time.
+            let t = frame_i as f64 / fps as f64 * time_scale;
             let to_px = |x: f64, y: f64| -> (f32, f32) {
                 ((x * scale + off_x) as f32, (y * scale + off_y) as f32)
             };
