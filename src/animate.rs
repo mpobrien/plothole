@@ -1,4 +1,5 @@
 use std::fs::File;
+use rayon::prelude::*;
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Stroke as SkiaStroke, Transform};
 use crate::motion::{self, AccelerationProfile, Vec2d};
 
@@ -23,7 +24,6 @@ pub fn animate(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (min_x, min_y, max_x, max_y) = bounding_box(paths).ok_or("empty drawing")?;
 
-    // Map drawing coordinates to pixel space with uniform scale and centering.
     let padding = 20.0f64;
     let draw_w = (max_x - min_x).max(1e-9);
     let draw_h = (max_y - min_y).max(1e-9);
@@ -31,11 +31,7 @@ pub fn animate(
         .min((height as f64 - 2.0 * padding) / draw_h);
     let off_x = padding + (width as f64 - 2.0 * padding - draw_w * scale) / 2.0 - min_x * scale;
     let off_y = padding + (height as f64 - 2.0 * padding - draw_h * scale) / 2.0 - min_y * scale;
-    let to_px = |x: f64, y: f64| -> (f32, f32) {
-        ((x * scale + off_x) as f32, (y * scale + off_y) as f32)
-    };
 
-    // Flatten all paths into segments with cumulative distance at each start.
     struct Seg {
         pen_down: bool,
         x1: f64, y1: f64,
@@ -60,81 +56,83 @@ pub fn animate(
 
     let speed = cum_dist / duration_s;
     let total_frames = (duration_s * fps as f64).ceil() as u32 + 1;
-    // GIF frame delay is in units of 10 ms.
     let frame_delay = (100.0 / fps as f64).round() as u16;
+
+    let frames: Vec<gif::Frame<'static>> = (0..total_frames)
+        .into_par_iter()
+        .map(|frame_i| {
+            let drawn_dist = (frame_i as f64 / fps as f64) * speed;
+            let to_px = |x: f64, y: f64| -> (f32, f32) {
+                ((x * scale + off_x) as f32, (y * scale + off_y) as f32)
+            };
+
+            let mut pixmap = Pixmap::new(width, height).expect("valid dimensions");
+            pixmap.fill(Color::WHITE);
+
+            let mut ink_paint = Paint::default();
+            ink_paint.set_color_rgba8(20, 20, 20, 255);
+            ink_paint.anti_alias = true;
+            let mut ink_stroke = SkiaStroke::default();
+            ink_stroke.width = 1.5;
+            let mut dot_paint = Paint::default();
+            dot_paint.set_color_rgba8(220, 50, 50, 255);
+            dot_paint.anti_alias = true;
+
+            let mut pen: Option<(f32, f32)> = None;
+
+            for seg in &segments {
+                if seg.dist_start >= drawn_dist {
+                    break;
+                }
+                let (px1, py1) = to_px(seg.x1, seg.y1);
+                let dist_end = seg.dist_start + seg.len;
+
+                if dist_end <= drawn_dist {
+                    if seg.pen_down && seg.len > 1e-9 {
+                        let (px2, py2) = to_px(seg.x2, seg.y2);
+                        let mut pb = PathBuilder::new();
+                        pb.move_to(px1, py1);
+                        pb.line_to(px2, py2);
+                        if let Some(path) = pb.finish() {
+                            pixmap.stroke_path(&path, &ink_paint, &ink_stroke, Transform::identity(), None);
+                        }
+                    }
+                    pen = Some(to_px(seg.x2, seg.y2));
+                } else {
+                    let t = if seg.len > 1e-9 { (drawn_dist - seg.dist_start) / seg.len } else { 0.0 };
+                    let mx = seg.x1 + t * (seg.x2 - seg.x1);
+                    let my = seg.y1 + t * (seg.y2 - seg.y1);
+                    let (pmx, pmy) = to_px(mx, my);
+                    if seg.pen_down && seg.len > 1e-9 {
+                        let mut pb = PathBuilder::new();
+                        pb.move_to(px1, py1);
+                        pb.line_to(pmx, pmy);
+                        if let Some(path) = pb.finish() {
+                            pixmap.stroke_path(&path, &ink_paint, &ink_stroke, Transform::identity(), None);
+                        }
+                    }
+                    pen = Some((pmx, pmy));
+                }
+            }
+
+            if let Some((px, py)) = pen {
+                if let Some(dot) = PathBuilder::from_circle(px, py, 3.5) {
+                    pixmap.fill_path(&dot, &dot_paint, FillRule::Winding, Transform::identity(), None);
+                }
+            }
+
+            let rgba = pixmap.data();
+            let rgb: Vec<u8> = rgba.chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+            let mut frame = gif::Frame::from_rgb_speed(width as u16, height as u16, &rgb, 10);
+            frame.delay = frame_delay;
+            frame
+        })
+        .collect();
 
     let file = File::create(output)?;
     let mut encoder = gif::Encoder::new(file, width as u16, height as u16, &[])?;
     encoder.set_repeat(gif::Repeat::Infinite)?;
-
-    let mut ink_paint = Paint::default();
-    ink_paint.set_color_rgba8(20, 20, 20, 255);
-    ink_paint.anti_alias = true;
-    let mut ink_stroke = SkiaStroke::default();
-    ink_stroke.width = 1.5;
-
-    let mut dot_paint = Paint::default();
-    dot_paint.set_color_rgba8(220, 50, 50, 255);
-    dot_paint.anti_alias = true;
-
-    for frame_i in 0..total_frames {
-        let drawn_dist = (frame_i as f64 / fps as f64) * speed;
-
-        let mut pixmap = Pixmap::new(width, height).ok_or("failed to create pixmap")?;
-        pixmap.fill(Color::WHITE);
-
-        let mut pen: Option<(f32, f32)> = None;
-
-        for seg in &segments {
-            if seg.dist_start >= drawn_dist {
-                break;
-            }
-            let (px1, py1) = to_px(seg.x1, seg.y1);
-            let dist_end = seg.dist_start + seg.len;
-
-            if dist_end <= drawn_dist {
-                // Fully drawn segment.
-                if seg.pen_down && seg.len > 1e-9 {
-                    let (px2, py2) = to_px(seg.x2, seg.y2);
-                    let mut pb = PathBuilder::new();
-                    pb.move_to(px1, py1);
-                    pb.line_to(px2, py2);
-                    if let Some(path) = pb.finish() {
-                        pixmap.stroke_path(&path, &ink_paint, &ink_stroke, Transform::identity(), None);
-                    }
-                }
-                pen = Some(to_px(seg.x2, seg.y2));
-            } else {
-                // Partial segment — interpolate to the current pen position.
-                let t = if seg.len > 1e-9 { (drawn_dist - seg.dist_start) / seg.len } else { 0.0 };
-                let mx = seg.x1 + t * (seg.x2 - seg.x1);
-                let my = seg.y1 + t * (seg.y2 - seg.y1);
-                let (pmx, pmy) = to_px(mx, my);
-
-                if seg.pen_down && seg.len > 1e-9 {
-                    let mut pb = PathBuilder::new();
-                    pb.move_to(px1, py1);
-                    pb.line_to(pmx, pmy);
-                    if let Some(path) = pb.finish() {
-                        pixmap.stroke_path(&path, &ink_paint, &ink_stroke, Transform::identity(), None);
-                    }
-                }
-                pen = Some((pmx, pmy));
-            }
-        }
-
-        // Draw the pen-position dot.
-        if let Some((px, py)) = pen {
-            if let Some(dot) = PathBuilder::from_circle(px, py, 3.5) {
-                pixmap.fill_path(&dot, &dot_paint, FillRule::Winding, Transform::identity(), None);
-            }
-        }
-
-        // Quantize RGBA → indexed GIF frame.
-        let rgba = pixmap.data();
-        let rgb: Vec<u8> = rgba.chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
-        let mut frame = gif::Frame::from_rgb_speed(width as u16, height as u16, &rgb, 10);
-        frame.delay = frame_delay;
+    for frame in frames {
         encoder.write_frame(&frame)?;
     }
 
@@ -164,21 +162,20 @@ pub fn animate_planned(
         .min((height as f64 - 2.0 * padding) / draw_h);
     let off_x = padding + (width as f64 - 2.0 * padding - draw_w * scale) / 2.0 - min_x * scale;
     let off_y = padding + (height as f64 - 2.0 * padding - draw_h * scale) / 2.0 - min_y * scale;
-    let to_px = |x: f64, y: f64| -> (f32, f32) {
-        ((x * scale + off_x) as f32, (y * scale + off_y) as f32)
-    };
 
-    // Run the motion planner on each path and record its start time in the timeline.
     struct PlannedPath {
         start_time: f64,
         plan: motion::Plan,
         pen_down: bool,
-        /// Original points in drawing coordinates, for ink rendering.
         points_f64: Vec<(f64, f64)>,
-        /// Cumulative distance at the start of each segment (same units as the planner).
         seg_starts: Vec<f64>,
         total_length: f64,
     }
+
+    // Safety: PlannedPath contains only Send+Sync types (f64, bool, Vec of
+    // primitives, motion::Plan which wraps Vec<Block> of plain-data structs).
+    unsafe impl Send for PlannedPath {}
+    unsafe impl Sync for PlannedPath {}
 
     let mut timeline: Vec<PlannedPath> = vec![];
     let mut current_time = 0.0f64;
@@ -191,7 +188,6 @@ pub fn animate_planned(
         let plan = motion::plan_path(&vec2d, profile);
         let duration = plan.duration();
 
-        // Precompute cumulative segment distances for ink rendering.
         let mut seg_starts = vec![0.0f64];
         let mut cum = 0.0f64;
         for w in path.points.windows(2) {
@@ -200,7 +196,6 @@ pub fn animate_planned(
             cum += ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt();
             seg_starts.push(cum);
         }
-        let total_length = cum;
 
         timeline.push(PlannedPath {
             start_time: current_time,
@@ -208,7 +203,7 @@ pub fn animate_planned(
             pen_down: path.pen_down,
             points_f64: path.points.clone(),
             seg_starts,
-            total_length,
+            total_length: cum,
         });
         current_time += duration;
     }
@@ -217,104 +212,102 @@ pub fn animate_planned(
     let total_frames = (total_duration * fps as f64).ceil() as u32 + 1;
     let frame_delay = (100.0 / fps as f64).round() as u16;
 
+    let frames: Vec<gif::Frame<'static>> = (0..total_frames)
+        .into_par_iter()
+        .map(|frame_i| {
+            let t = frame_i as f64 / fps as f64;
+            let to_px = |x: f64, y: f64| -> (f32, f32) {
+                ((x * scale + off_x) as f32, (y * scale + off_y) as f32)
+            };
+
+            let mut pixmap = Pixmap::new(width, height).expect("valid dimensions");
+            pixmap.fill(Color::WHITE);
+
+            let mut ink_paint = Paint::default();
+            ink_paint.set_color_rgba8(20, 20, 20, 255);
+            ink_paint.anti_alias = true;
+            let mut ink_stroke = SkiaStroke::default();
+            ink_stroke.width = 1.5;
+            let mut dot_paint = Paint::default();
+            dot_paint.set_color_rgba8(220, 50, 50, 255);
+            dot_paint.anti_alias = true;
+
+            let mut pen: Option<(f32, f32)> = None;
+
+            for pp in &timeline {
+                if t < pp.start_time {
+                    break;
+                }
+                let local_t = t - pp.start_time;
+                let duration = pp.plan.duration();
+
+                let drawn_distance = if local_t >= duration {
+                    pp.total_length
+                } else {
+                    pp.plan.instant(local_t).distance_m.min(pp.total_length)
+                };
+
+                pen = if local_t >= duration {
+                    pp.points_f64.last().map(|&(x, y)| to_px(x, y))
+                } else {
+                    let inst = pp.plan.instant(local_t);
+                    Some(to_px(inst.position.x, inst.position.y))
+                };
+
+                if !pp.pen_down {
+                    continue;
+                }
+
+                for (i, w) in pp.points_f64.windows(2).enumerate() {
+                    let seg_start_d = pp.seg_starts[i];
+                    let seg_end_d = pp.seg_starts[i + 1];
+
+                    if seg_start_d >= drawn_distance {
+                        break;
+                    }
+
+                    let (x1, y1) = w[0];
+                    let (x2, y2) = w[1];
+                    let (px1, py1) = to_px(x1, y1);
+                    let (px2, py2) = if seg_end_d <= drawn_distance {
+                        to_px(x2, y2)
+                    } else {
+                        let seg_len = seg_end_d - seg_start_d;
+                        let frac = if seg_len > 1e-9 {
+                            (drawn_distance - seg_start_d) / seg_len
+                        } else {
+                            0.0
+                        };
+                        to_px(x1 + frac * (x2 - x1), y1 + frac * (y2 - y1))
+                    };
+
+                    let mut pb = PathBuilder::new();
+                    pb.move_to(px1, py1);
+                    pb.line_to(px2, py2);
+                    if let Some(path) = pb.finish() {
+                        pixmap.stroke_path(&path, &ink_paint, &ink_stroke, Transform::identity(), None);
+                    }
+                }
+            }
+
+            if let Some((px, py)) = pen {
+                if let Some(dot) = PathBuilder::from_circle(px, py, 3.5) {
+                    pixmap.fill_path(&dot, &dot_paint, FillRule::Winding, Transform::identity(), None);
+                }
+            }
+
+            let rgba = pixmap.data();
+            let rgb: Vec<u8> = rgba.chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
+            let mut frame = gif::Frame::from_rgb_speed(width as u16, height as u16, &rgb, 10);
+            frame.delay = frame_delay;
+            frame
+        })
+        .collect();
+
     let file = File::create(output)?;
     let mut encoder = gif::Encoder::new(file, width as u16, height as u16, &[])?;
     encoder.set_repeat(gif::Repeat::Infinite)?;
-
-    let mut ink_paint = Paint::default();
-    ink_paint.set_color_rgba8(20, 20, 20, 255);
-    ink_paint.anti_alias = true;
-    let mut ink_stroke = SkiaStroke::default();
-    ink_stroke.width = 1.5;
-
-    let mut dot_paint = Paint::default();
-    dot_paint.set_color_rgba8(220, 50, 50, 255);
-    dot_paint.anti_alias = true;
-
-    for frame_i in 0..total_frames {
-        let t = frame_i as f64 / fps as f64;
-
-        let mut pixmap = Pixmap::new(width, height).ok_or("failed to create pixmap")?;
-        pixmap.fill(Color::WHITE);
-
-        let mut pen: Option<(f32, f32)> = None;
-
-        for pp in &timeline {
-            if t < pp.start_time {
-                break;
-            }
-            let local_t = t - pp.start_time;
-            let duration = pp.plan.duration();
-
-            // How far along the path has the pen traveled?
-            let drawn_distance = if local_t >= duration {
-                pp.total_length
-            } else {
-                let inst = pp.plan.instant(local_t);
-                // inst.distance_m is in planner units, which equal drawing units since
-                // we fed drawing-unit coordinates to the planner.
-                inst.distance_m.min(pp.total_length)
-            };
-
-            // Current pen position in pixel space.
-            let pen_px = if local_t >= duration {
-                pp.points_f64.last().map(|&(x, y)| to_px(x, y))
-            } else {
-                let inst = pp.plan.instant(local_t);
-                Some(to_px(inst.position.x, inst.position.y))
-            };
-            pen = pen_px;
-
-            if !pp.pen_down {
-                continue;
-            }
-
-            // Draw the ink laid down so far: full segments plus a partial last one.
-            let points = &pp.points_f64;
-            for (i, w) in points.windows(2).enumerate() {
-                let seg_start_d = pp.seg_starts[i];
-                let seg_end_d = pp.seg_starts[i + 1];
-
-                if seg_start_d >= drawn_distance {
-                    break;
-                }
-
-                let (x1, y1) = w[0];
-                let (x2, y2) = w[1];
-                let (px1, py1) = to_px(x1, y1);
-
-                let (px2, py2) = if seg_end_d <= drawn_distance {
-                    to_px(x2, y2)
-                } else {
-                    // Partial segment: interpolate to the exact drawn distance.
-                    let seg_len = seg_end_d - seg_start_d;
-                    let frac = if seg_len > 1e-9 {
-                        (drawn_distance - seg_start_d) / seg_len
-                    } else {
-                        0.0
-                    };
-                    to_px(x1 + frac * (x2 - x1), y1 + frac * (y2 - y1))
-                };
-
-                let mut pb = PathBuilder::new();
-                pb.move_to(px1, py1);
-                pb.line_to(px2, py2);
-                if let Some(path) = pb.finish() {
-                    pixmap.stroke_path(&path, &ink_paint, &ink_stroke, Transform::identity(), None);
-                }
-            }
-        }
-
-        if let Some((px, py)) = pen {
-            if let Some(dot) = PathBuilder::from_circle(px, py, 3.5) {
-                pixmap.fill_path(&dot, &dot_paint, FillRule::Winding, Transform::identity(), None);
-            }
-        }
-
-        let rgba = pixmap.data();
-        let rgb: Vec<u8> = rgba.chunks(4).flat_map(|p| [p[0], p[1], p[2]]).collect();
-        let mut frame = gif::Frame::from_rgb_speed(width as u16, height as u16, &rgb, 10);
-        frame.delay = frame_delay;
+    for frame in frames {
         encoder.write_frame(&frame)?;
     }
 

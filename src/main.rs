@@ -1,11 +1,15 @@
 pub mod device;
 pub mod font;
+mod animate;
 mod hershey;
+use crate::font::ToF64;
 use num_traits::{Num, Signed, Zero};
 use std::ops::Add;
 use std::ops::Mul;
 use std::ops::Neg;
 use std::ops::Sub;
+
+mod motion;
 
 use std::{fs::File, ops::Deref};
 
@@ -34,6 +38,39 @@ enum Commands {
         #[arg(short, long)]
         font_name: String,
     },
+    /// Render text as an animated GIF showing the plot being drawn,
+    /// with pen speed driven by the motion planner (acceleration/deceleration visible)
+    Animate {
+        #[arg(short, long)]
+        text: String,
+
+        #[arg(short, long)]
+        font_name: String,
+
+        #[arg(short, long, default_value = "out.gif")]
+        output: String,
+
+        #[arg(long, default_value = "30")]
+        fps: u32,
+
+        #[arg(long, default_value = "800")]
+        width: u32,
+
+        #[arg(long, default_value = "600")]
+        height: u32,
+
+        /// Maximum pen velocity (font units/second)
+        #[arg(long, default_value = "500.0")]
+        max_velocity: f64,
+
+        /// Pen acceleration (font units/second²)
+        #[arg(long, default_value = "2000.0")]
+        acceleration: f64,
+
+        /// Cornering factor — higher = faster through corners (font units)
+        #[arg(long, default_value = "1.0")]
+        cornering: f64,
+    },
 }
 
 fn main() {
@@ -42,7 +79,34 @@ fn main() {
         Commands::RenderText { text, font_name } => {
             render_text(&text, &font_name);
         }
+        Commands::Animate { text, font_name, output, fps, width, height, max_velocity, acceleration, cornering } => {
+            let font = hershey::fonts()
+                .get(&font_name.to_uppercase() as &str)
+                .expect("unknown font name");
+            let drawing = Drawing::new(text_to_paths(&text, font));
+            let paths = drawing_to_drawn_paths(&drawing);
+            let profile = motion::AccelerationProfile {
+                acceleration,
+                maximum_velocity: max_velocity,
+                cornering_factor: cornering,
+            };
+            animate::animate_planned(&paths, &profile, &output, width, height, fps)
+                .expect("animation failed");
+        }
     }
+}
+
+fn drawing_to_drawn_paths(drawing: &Drawing<f64>) -> Vec<animate::DrawnPath> {
+    drawing.paths.iter().map(|pp| {
+        let (pen_down, path) = match pp {
+            PenPath::PenUp(p) => (false, p),
+            PenPath::PenDown(p) => (true, p),
+        };
+        animate::DrawnPath {
+            pen_down,
+            points: path.points().iter().map(|v| (v.x, v.y)).collect(),
+        }
+    }).collect()
 }
 
 fn render_text(text: &str, font_name: &str) {
@@ -133,6 +197,7 @@ where
         + Mul<Output = T>
         + Add<Output = T>
         + PartialOrd
+        + ToF64
         + Copy,
 {
     PenUp(Path<T>),
@@ -149,6 +214,7 @@ where
         + Mul<Output = T>
         + Add<Output = T>
         + PartialOrd
+        + ToF64
         + Copy,
 {
     type Target = Path<T>;
@@ -170,6 +236,7 @@ where
         + Mul<Output = T>
         + Add<Output = T>
         + PartialOrd
+        + ToF64
         + Copy,
 {
     paths: Vec<PenPath<T>>,
@@ -184,6 +251,7 @@ where
         + Sub<Output = T>
         + Mul<Output = T>
         + Add<Output = T>
+        + ToF64
         + PartialOrd
         + Copy,
 {
@@ -262,6 +330,7 @@ where
         + Sub<Output = T>
         + Mul<Output = T>
         + Add<Output = T>
+        + ToF64
         + PartialOrd
         + Copy,
 {

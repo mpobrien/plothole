@@ -14,6 +14,7 @@ where
         + Sub<Output = T>
         + Mul<Output = T>
         + Add<Output = T>
+        + ToF64
         + PartialOrd
         + Copy,
 {
@@ -32,6 +33,7 @@ where
         + Sub<Output = T>
         + Mul<Output = T>
         + Add<Output = T>
+        + ToF64
         + PartialOrd
         + Copy,
 {
@@ -48,6 +50,32 @@ where
         + Sub<Output = T>
         + Mul<Output = T>
         + Add<Output = T>
+        + ToF64
+        + PartialOrd
+        + Copy,
+{
+    pub fn new(x: T, y: T) -> Self {
+        Self { x, y }
+    }
+
+    pub fn distance(&self, other: &Vec2d<T>) -> f64 {
+        let dx = other.x - self.x;
+        let dy = other.y - self.y;
+        let z = ((dx * dx) + (dy * dy)).to_f64().unwrap();
+        z.sqrt()
+    }
+}
+
+impl<T> Vec2d<T>
+where
+    T: Num
+        + Signed
+        + Zero
+        + Neg<Output = T>
+        + Sub<Output = T>
+        + Mul<Output = T>
+        + Add<Output = T>
+        + ToF64
         + PartialOrd
         + Copy,
 {
@@ -65,6 +93,7 @@ where
         + Sub<Output = T>
         + Mul<Output = T>
         + Add<Output = T>
+        + ToF64
         + PartialOrd
         + Copy,
 {
@@ -88,6 +117,7 @@ where
         + Sub<Output = T>
         + Mul<Output = T>
         + Add<Output = T>
+        + ToF64
         + PartialOrd
         + Copy,
 {
@@ -103,6 +133,7 @@ where
         + Sub<Output = T>
         + Mul<Output = T>
         + Add<Output = T>
+        + ToF64
         + PartialOrd
         + Copy,
 {
@@ -114,12 +145,41 @@ where
         self.points.push(point);
     }
 
+    pub fn start(&self) -> &Vec2d<T> {
+        &self.points.first().unwrap()
+    }
+    pub fn end(&self) -> &Vec2d<T> {
+        &self.points.last().unwrap()
+    }
+
     pub fn new(points: Vec<Vec2d<T>>) -> Self {
         Self { points }
     }
 
     pub fn points<'a>(&'a self) -> &'a Vec<Vec2d<T>> {
         &self.points
+    }
+}
+
+pub trait ToF64 {
+    fn to_f64(self) -> Option<f64>;
+}
+
+impl ToF64 for f64 {
+    fn to_f64(self) -> Option<f64> {
+        Some(self)
+    }
+}
+
+impl ToF64 for f32 {
+    fn to_f64(self) -> Option<f64> {
+        Some(self as f64)
+    }
+}
+
+impl ToF64 for i32 {
+    fn to_f64(self) -> Option<f64> {
+        Some(self as f64)
     }
 }
 
