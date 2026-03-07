@@ -78,6 +78,8 @@ enum Commands {
         #[arg(long, value_parser = parse_duration)]
         duration: Option<f64>,
     },
+    /// List available font names
+    ListFonts,
     /// Run the motion planner and print a summary of the drawing and plan
     Inspect {
         #[arg(short, long)]
@@ -135,6 +137,13 @@ fn parse_duration(s: &str) -> Result<f64, String> {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
+        Commands::ListFonts => {
+            let mut names: Vec<String> = hershey::fonts().keys().cloned().collect();
+            names.sort();
+            for name in names {
+                println!("{}", name);
+            }
+        }
         Commands::RenderText { text, font_name } => {
             render_text(&text, &font_name);
         }
