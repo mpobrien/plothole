@@ -320,6 +320,54 @@ pub fn animate_planned(
     Ok(())
 }
 
+/// Render the completed drawing as a single PNG frame (no animation, no pen dot).
+pub fn render_snapshot(
+    paths: &[DrawnPath],
+    output: &str,
+    width: u32,
+    height: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (min_x, min_y, max_x, max_y) = bounding_box(paths).ok_or("empty drawing")?;
+
+    let padding = 20.0f64;
+    let draw_w = (max_x - min_x).max(1e-9);
+    let draw_h = (max_y - min_y).max(1e-9);
+    let scale = ((width as f64 - 2.0 * padding) / draw_w)
+        .min((height as f64 - 2.0 * padding) / draw_h);
+    let off_x = padding + (width as f64 - 2.0 * padding - draw_w * scale) / 2.0 - min_x * scale;
+    let off_y = padding + (height as f64 - 2.0 * padding - draw_h * scale) / 2.0 - min_y * scale;
+
+    let to_px = |x: f64, y: f64| -> (f32, f32) {
+        ((x * scale + off_x) as f32, (y * scale + off_y) as f32)
+    };
+
+    let mut pixmap = Pixmap::new(width, height).ok_or("invalid dimensions")?;
+    pixmap.fill(Color::WHITE);
+
+    let mut ink_paint = Paint::default();
+    ink_paint.set_color_rgba8(20, 20, 20, 255);
+    ink_paint.anti_alias = true;
+    let mut ink_stroke = SkiaStroke::default();
+    ink_stroke.width = 1.5;
+
+    for path in paths {
+        if !path.pen_down { continue; }
+        for w in path.points.windows(2) {
+            let (px1, py1) = to_px(w[0].0, w[0].1);
+            let (px2, py2) = to_px(w[1].0, w[1].1);
+            let mut pb = PathBuilder::new();
+            pb.move_to(px1, py1);
+            pb.line_to(px2, py2);
+            if let Some(p) = pb.finish() {
+                pixmap.stroke_path(&p, &ink_paint, &ink_stroke, Transform::identity(), None);
+            }
+        }
+    }
+
+    pixmap.save_png(output)?;
+    Ok(())
+}
+
 fn bounding_box(paths: &[DrawnPath]) -> Option<(f64, f64, f64, f64)> {
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;

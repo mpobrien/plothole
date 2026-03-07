@@ -11,7 +11,10 @@ use std::ops::Sub;
 
 mod motion;
 mod optimize;
+mod ttf;
+mod tui;
 use optimize::PathOptimizer;
+use ttf::TtfFont;
 
 /// Millimetres per drawing unit.
 ///
@@ -62,8 +65,13 @@ enum Commands {
         #[arg(short, long)]
         text: String,
 
+        /// Hershey font name (see list-fonts). Mutually exclusive with --ttf-file.
         #[arg(short, long)]
-        font_name: String,
+        font_name: Option<String>,
+
+        /// Path to a TTF font file. Mutually exclusive with --font-name.
+        #[arg(long)]
+        ttf_file: Option<String>,
 
         #[arg(short, long, default_value = "out.gif")]
         output: String,
@@ -93,16 +101,48 @@ enum Commands {
         /// the plotter timeline is scaled to fit; omit to use real plotter time.
         #[arg(long, value_parser = parse_duration)]
         duration: Option<f64>,
+
+        /// Render only the final frame as a PNG instead of an animated GIF.
+        #[arg(long)]
+        snapshot: bool,
+
+        /// TTF face index (for .ttc collections with multiple variants)
+        #[arg(long, default_value = "0")]
+        ttf_face: u32,
+
+        /// Variable font axis override, e.g. --ttf-axis wght=700. Repeatable.
+        #[arg(long = "ttf-axis", value_parser = parse_ttf_axis, action = clap::ArgAction::Append)]
+        ttf_axes: Vec<(String, f32)>,
+
+        /// TTF raster resolution in pixels (higher = finer skeleton, slower)
+        #[arg(long, default_value = "128.0")]
+        raster_px: f32,
+
+        /// Douglas-Peucker simplification tolerance in skeleton pixels (lower = more detail)
+        #[arg(long, default_value = "1.5")]
+        dp_epsilon: f64,
     },
     /// List available font names
     ListFonts,
+    /// List all faces in a TTF/TTC file
+    ListFaces {
+        #[arg(long)]
+        ttf_file: String,
+    },
+    /// Open an interactive terminal controller for the connected AxiDraw
+    Control,
     /// Run the motion planner and print a summary of the drawing and plan
     Inspect {
         #[arg(short, long)]
         text: String,
 
+        /// Hershey font name (see list-fonts). Mutually exclusive with --ttf-file.
         #[arg(short, long)]
-        font_name: String,
+        font_name: Option<String>,
+
+        /// Path to a TTF font file. Mutually exclusive with --font-name.
+        #[arg(long)]
+        ttf_file: Option<String>,
 
         /// Maximum pen velocity (font units/second)
         #[arg(long, default_value = "500.0")]
@@ -115,6 +155,22 @@ enum Commands {
         /// Cornering factor — higher = faster through corners (font units)
         #[arg(long, default_value = "1.0")]
         cornering: f64,
+
+        /// TTF face index (for .ttc collections with multiple variants)
+        #[arg(long, default_value = "0")]
+        ttf_face: u32,
+
+        /// Variable font axis override, e.g. --ttf-axis wght=700. Repeatable.
+        #[arg(long = "ttf-axis", value_parser = parse_ttf_axis, action = clap::ArgAction::Append)]
+        ttf_axes: Vec<(String, f32)>,
+
+        /// TTF raster resolution in pixels (higher = finer skeleton, slower)
+        #[arg(long, default_value = "128.0")]
+        raster_px: f32,
+
+        /// Douglas-Peucker simplification tolerance in skeleton pixels (lower = more detail)
+        #[arg(long, default_value = "1.5")]
+        dp_epsilon: f64,
     },
 }
 
@@ -150,9 +206,51 @@ fn parse_duration(s: &str) -> Result<f64, String> {
     Ok(total)
 }
 
+/// Resolve text → grouped paths from either a Hershey font name or a TTF file.
+/// Exactly one of `font_name` / `ttf_file` must be `Some`.
+fn resolve_paths(
+    text: &str,
+    font_name: Option<&str>,
+    ttf_file: Option<&str>,
+    ttf_face: u32,
+    raster_px: f32,
+    dp_epsilon: f64,
+    ttf_axes: &[(String, f32)],
+) -> Vec<Vec<Path<f64>>> {
+    match (font_name, ttf_file) {
+        (Some(name), None) => {
+            let font = hershey::fonts()
+                .get(&name.to_uppercase() as &str)
+                .expect("unknown font name");
+            text_to_paths(text, font)
+        }
+        (None, Some(path)) => {
+            TtfFont::from_file(path, ttf_face)
+                .expect("failed to load TTF font")
+                .text_to_paths(text, raster_px, dp_epsilon, ttf_axes)
+        }
+        _ => panic!("provide exactly one of --font-name or --ttf-file"),
+    }
+}
+
+fn parse_ttf_axis(s: &str) -> Result<(String, f32), String> {
+    let (tag, val) = s.split_once('=')
+        .ok_or_else(|| format!("expected TAG=VALUE, got \"{s}\""))?;
+    if tag.len() != 4 {
+        return Err(format!("axis tag must be exactly 4 characters, got \"{tag}\""));
+    }
+    let value = val.parse::<f32>()
+        .map_err(|_| format!("invalid axis value \"{val}\""))?;
+    Ok((tag.to_string(), value))
+}
+
 fn main() {
     let cli = Cli::parse();
     match cli.command {
+        Commands::Control => {
+            let device = device::open_device().expect("failed to open AxiDraw");
+            tui::run(device);
+        }
         Commands::ListFonts => {
             let mut names: Vec<String> = hershey::fonts().keys().cloned().collect();
             names.sort();
@@ -160,14 +258,55 @@ fn main() {
                 println!("{}", name);
             }
         }
+        Commands::ListFaces { ttf_file } => {
+            let data = std::fs::read(&ttf_file).expect("failed to read TTF file");
+
+            // Helper: extract a name-table string by name ID.
+            let get_name = |face: &ttf_parser::Face, id: u16| -> String {
+                face.names().into_iter()
+                    .find(|n| n.name_id == id)
+                    .and_then(|n| n.to_string())
+                    .unwrap_or_default()
+            };
+
+            // Count TTC faces (stops when Face::parse fails).
+            let mut ttc_count = 0u32;
+            for index in 0.. {
+                match ttf_parser::Face::parse(&data, index) {
+                    Ok(_) => ttc_count += 1,
+                    Err(_) => break,
+                }
+            }
+
+            for index in 0..ttc_count {
+                let face = ttf_parser::Face::parse(&data, index).unwrap();
+                let family = get_name(&face, 1);
+                let style  = get_name(&face, 2);
+                println!("face {index}: {family} {style}");
+
+                // Variable fonts have axes rather than separate TTC faces.
+                // The named instances your font browser shows are predefined
+                // axis combinations; ttf-parser 0.21 exposes the axes only.
+                if face.is_variable() {
+                    for axis in face.variation_axes() {
+                        let axis_name = get_name(&face, axis.name_id);
+                        println!("  axis [{tag}] {axis_name}: {min} – {max} (default {def})",
+                            tag = axis.tag,
+                            axis_name = axis_name,
+                            min = axis.min_value,
+                            max = axis.max_value,
+                            def = axis.def_value,
+                        );
+                    }
+                    println!("  (use --ttf-axis TAG=VALUE to set axes, e.g. --ttf-axis wght=700)");
+                }
+            }
+        }
         Commands::RenderText { text, font_name } => {
             render_text(&text, &font_name);
         }
-        Commands::Inspect { text, font_name, max_velocity, acceleration, cornering } => {
-            let font = hershey::fonts()
-                .get(&font_name.to_uppercase() as &str)
-                .expect("unknown font name");
-            let raw = text_to_paths(&text, font);
+        Commands::Inspect { text, font_name, ttf_file, max_velocity, acceleration, cornering, ttf_face, ttf_axes, raster_px, dp_epsilon } => {
+            let raw = resolve_paths(&text, font_name.as_deref(), ttf_file.as_deref(), ttf_face, raster_px, dp_epsilon, &ttf_axes);
             let original = drawing_to_drawn_paths(&Drawing::new(
                 raw.clone().into_iter().flatten().collect()
             ));
@@ -179,20 +318,22 @@ fn main() {
             };
             inspect(&original, &optimized, &profile);
         }
-        Commands::Animate { text, font_name, output, fps, width, height, max_velocity, acceleration, cornering, duration } => {
-            let font = hershey::fonts()
-                .get(&font_name.to_uppercase() as &str)
-                .expect("unknown font name");
-            let drawing = Drawing::new(optimize_path_order(text_to_paths(&text, font)));
-
+        Commands::Animate { text, font_name, ttf_file, output, fps, width, height, max_velocity, acceleration, cornering, duration, snapshot, ttf_face, ttf_axes, raster_px, dp_epsilon } => {
+            let raw = resolve_paths(&text, font_name.as_deref(), ttf_file.as_deref(), ttf_face, raster_px, dp_epsilon, &ttf_axes);
+            let drawing = Drawing::new(optimize_path_order(raw));
             let paths = drawing_to_drawn_paths(&drawing);
-            let profile = motion::AccelerationProfile {
-                acceleration,
-                maximum_velocity: max_velocity,
-                cornering_factor: cornering,
-            };
-            animate::animate_planned(&paths, &profile, &output, width, height, fps, duration)
-                .expect("animation failed");
+            if snapshot {
+                animate::render_snapshot(&paths, &output, width, height)
+                    .expect("snapshot failed");
+            } else {
+                let profile = motion::AccelerationProfile {
+                    acceleration,
+                    maximum_velocity: max_velocity,
+                    cornering_factor: cornering,
+                };
+                animate::animate_planned(&paths, &profile, &output, width, height, fps, duration)
+                    .expect("animation failed");
+            }
         }
     }
 }
