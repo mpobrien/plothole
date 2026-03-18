@@ -717,6 +717,32 @@ fn do_stuff(rc: &mut impl RenderContext) {
 }
 
 /// Optimize stroke ordering within each character group independently, then
+/// Merge consecutive strokes whose endpoint/startpoint are within `tol` of
+/// each other into a single continuous path, eliminating the pen-up/down
+/// that would otherwise occur at that join.
+fn chain_merge_strokes(strokes: Vec<Path<f64>>, tol: f64) -> Vec<Path<f64>> {
+    if strokes.is_empty() { return strokes; }
+    let mut result: Vec<Path<f64>> = Vec::new();
+    let mut current: Vec<Vec2d<f64>> = strokes[0].points().clone();
+
+    for stroke in strokes.into_iter().skip(1) {
+        let pts = stroke.points();
+        if pts.is_empty() { continue; }
+        let last = current.last().unwrap().clone();
+        let first = pts[0].clone();
+        let dist = ((last.x - first.x).powi(2) + (last.y - first.y).powi(2)).sqrt();
+        if dist <= tol {
+            // Endpoints touch — extend current chain, skip the duplicate first point.
+            current.extend_from_slice(&pts[1..]);
+        } else {
+            result.push(Path::new(current));
+            current = pts.clone();
+        }
+    }
+    result.push(Path::new(current));
+    result
+}
+
 /// concatenate groups in character order. The pen position carried into each
 /// group is the exit point of the previous group.
 fn optimize_path_order(grouped: Vec<Vec<Path<f64>>>) -> Vec<Path<f64>> {

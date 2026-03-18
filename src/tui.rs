@@ -1,4 +1,5 @@
 use std::io::{self, Write};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
@@ -386,6 +387,9 @@ fn plot_text(state: &mut State, text: &str) -> Result<(), Box<dyn std::error::Er
     };
 
     let flat = crate::optimize_path_order(grouped);
+    // Merge strokes whose endpoints touch into one continuous path to avoid
+    // unnecessary pen-up/down at corners (tolerance: ~0.18 mm in plotter space).
+    let flat = crate::chain_merge_strokes(flat, 0.5);
     let strokes: Vec<_> = flat.into_iter().filter(|p| p.points().len() >= 2).collect();
 
     if strokes.is_empty() {
@@ -594,8 +598,76 @@ fn calibrate_pen(state: &mut State) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+// ── State persistence ──────────────────────────────────────────────────────────
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedState {
+    position_x:   f64,
+    position_y:   f64,
+    pen_up_pos:   i32,
+    pen_down_pos:  i32,
+    calibrated:   bool,
+    speed_mm_s:   f64,
+    accel_mm_s2:  f64,
+    step_mode:    String,
+    font_name:    String,
+    font_scale:   f64,
+    iosevka_file: Option<String>,
+}
+
+fn state_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".plothole.json")
+}
+
+fn load_persisted() -> Option<PersistedState> {
+    let data = std::fs::read_to_string(state_path()).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
+fn save_persisted(state: &State) {
+    let ps = PersistedState {
+        position_x:   state.position.0,
+        position_y:   state.position.1,
+        pen_up_pos:   state.pen_up_pos,
+        pen_down_pos:  state.pen_down_pos,
+        calibrated:   state.calibrated,
+        speed_mm_s:   state.speed_mm_s,
+        accel_mm_s2:  state.accel_mm_s2,
+        step_mode:    step_mode_label(state.step_mode).to_string(),
+        font_name:    state.font_name.clone(),
+        font_scale:   state.font_scale,
+        iosevka_file: state.iosevka_file.clone(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&ps) {
+        let _ = std::fs::write(state_path(), json);
+    }
+}
+
 pub fn run(device: Device) {
     let mut state = State::new(device);
+
+    if let Some(ps) = load_persisted() {
+        state.position    = (ps.position_x, ps.position_y);
+        state.pen_up_pos  = ps.pen_up_pos;
+        state.pen_down_pos = ps.pen_down_pos;
+        state.calibrated  = ps.calibrated;
+        state.speed_mm_s  = ps.speed_mm_s;
+        state.accel_mm_s2 = ps.accel_mm_s2;
+        state.font_name   = ps.font_name;
+        state.font_scale  = ps.font_scale;
+        state.iosevka_file = ps.iosevka_file;
+        if let Some(mode) = parse_step_mode(&ps.step_mode) {
+            state.step_mode = mode;
+        }
+        println!(
+            "Restored: pos=({:.1},{:.1})mm  pen up={} down={}{}",
+            state.position.0, state.position.1,
+            state.pen_up_pos, state.pen_down_pos,
+            if state.calibrated { "" } else { "  (uncalibrated)" },
+        );
+    }
+
     println!("AxiDraw controller — type 'help' for commands");
 
     loop {
@@ -610,8 +682,8 @@ pub fn run(device: Device) {
         }
 
         match handle(&mut state, &line) {
-            Ok(true)  => break,
-            Ok(false) => {}
+            Ok(true)  => { save_persisted(&state); break; }
+            Ok(false) => save_persisted(&state),
             Err(e)    => eprintln!("Error: {e}"),
         }
     }

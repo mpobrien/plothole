@@ -19,13 +19,15 @@ use crate::font::{Path, Vec2d};
 
 #[derive(Deserialize)]
 struct Meta {
-    upm:      f64,
-    ascender: f64,
+    upm:          f64,
+    cell_advance: f64,
+    ascender:     f64,
 }
 
 #[derive(Deserialize)]
 struct GlyphData {
-    advance: f64,
+    #[allow(dead_code)]
+    advance: f64, // kept for JSON compatibility; actual advance comes from meta.cell_advance
     strokes: Vec<Vec<Point>>,
 }
 
@@ -64,9 +66,11 @@ impl IosevkaFont {
     /// `em_size` is the desired output size in the same units as downstream
     /// coordinates (one em = cap-height, scaled from UPM).
     pub fn text_to_paths(&self, text: &str, em_size: f64) -> Vec<Vec<Path<f64>>> {
-        let upm         = self.skeleton.meta.upm;
-        let scale       = em_size / upm;
-        let line_height = self.skeleton.meta.ascender * scale * 1.2;
+        let upm          = self.skeleton.meta.upm;
+        let cell_advance = self.skeleton.meta.cell_advance;
+        let scale        = em_size / upm;
+        let advance      = cell_advance * scale; // same for every glyph — true monospace
+        let line_height  = self.skeleton.meta.ascender * scale * 1.2;
 
         let mut result   = Vec::new();
         let mut cursor_x = 0.0f64;
@@ -81,11 +85,12 @@ impl IosevkaFont {
 
             let key = ch.to_string();
             let Some(glyph) = self.skeleton.glyphs.get(&key) else {
+                // Unknown glyph: emit an empty slot but still advance the cursor.
                 result.push(vec![]);
+                cursor_x += advance;
                 continue;
             };
 
-            let advance = glyph.advance * scale;
             let paths: Vec<Path<f64>> = glyph.strokes.iter()
                 .filter(|s| s.len() >= 2)
                 .map(|stroke| {
@@ -97,7 +102,7 @@ impl IosevkaFont {
                 .collect();
 
             result.push(paths);
-            cursor_x += advance;
+            cursor_x += advance; // fixed monospace advance, not glyph.advance
         }
 
         result
