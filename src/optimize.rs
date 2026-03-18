@@ -15,8 +15,12 @@ pub struct PathOrder {
 
 /// Implemented by any algorithm that reorders pen-down paths to minimise
 /// total pen-up travel distance.
+///
+/// `exit_target`: if `Some`, the optimizer additionally minimises the distance
+/// from the group's exit point to that target (i.e. the start of the next
+/// group), so the pen ends up as close as possible to the next character.
 pub trait PathOptimizer {
-    fn optimize(&self, paths: &[PathEndpoints], start: (f64, f64)) -> Vec<PathOrder>;
+    fn optimize(&self, paths: &[PathEndpoints], start: (f64, f64), exit_target: Option<(f64, f64)>) -> Vec<PathOrder>;
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────────
@@ -47,23 +51,32 @@ pub fn penup_distance(paths: &[PathEndpoints], order: &[PathOrder], start: (f64,
 pub struct NearestNeighbor;
 
 impl PathOptimizer for NearestNeighbor {
-    fn optimize(&self, paths: &[PathEndpoints], start: (f64, f64)) -> Vec<PathOrder> {
+    fn optimize(&self, paths: &[PathEndpoints], start: (f64, f64), exit_target: Option<(f64, f64)>) -> Vec<PathOrder> {
         let n = paths.len();
-        let mut visited = vec![false; n];
-        let mut result  = Vec::with_capacity(n);
-        let mut pen     = start;
+        let mut visited  = vec![false; n];
+        let mut result   = Vec::with_capacity(n);
+        let mut pen      = start;
+        let mut remaining = n;
 
         for _ in 0..n {
+            remaining -= 1;
+            let is_last = remaining == 0;
+
             let mut best_cost = f64::INFINITY;
             let mut best_i    = 0;
             let mut best_rev  = false;
 
             for (i, p) in paths.iter().enumerate() {
                 if visited[i] { continue; }
-                let d_fwd = dist(pen, p.start);
-                let d_rev = dist(pen, p.end);
-                if d_fwd < best_cost { best_cost = d_fwd; best_i = i; best_rev = false; }
-                if d_rev < best_cost { best_cost = d_rev; best_i = i; best_rev = true;  }
+                // On the last step, include the cost of reaching the exit target
+                // from whichever endpoint we exit through.
+                let exit_cost = |exit: (f64, f64)| -> f64 {
+                    if is_last { exit_target.map_or(0.0, |t| dist(exit, t)) } else { 0.0 }
+                };
+                let cost_fwd = dist(pen, p.start) + exit_cost(p.end);
+                let cost_rev = dist(pen, p.end)   + exit_cost(p.start);
+                if cost_fwd < best_cost { best_cost = cost_fwd; best_i = i; best_rev = false; }
+                if cost_rev < best_cost { best_cost = cost_rev; best_i = i; best_rev = true;  }
             }
 
             visited[best_i] = true;
@@ -94,7 +107,7 @@ pub const HELD_KARP_LIMIT: usize = 20;
 pub struct HeldKarp;
 
 impl PathOptimizer for HeldKarp {
-    fn optimize(&self, paths: &[PathEndpoints], start: (f64, f64)) -> Vec<PathOrder> {
+    fn optimize(&self, paths: &[PathEndpoints], start: (f64, f64), exit_target: Option<(f64, f64)>) -> Vec<PathOrder> {
         let n = paths.len();
         assert!(
             n <= HELD_KARP_LIMIT,
@@ -160,11 +173,16 @@ impl PathOptimizer for HeldKarp {
         }
 
         // ── find the best terminal state ──────────────────────────────────────
+        // Include the cost of reaching the next group's entry (if known), so
+        // the optimizer chooses an exit that minimises total travel including
+        // the pen-up move to the next character.
         let (mut best_i, mut best_dir) = (0, 0);
         let mut best_cost = f64::INFINITY;
         for i in 0..n {
             for dir in 0..2usize {
-                let c = dp[idx(full_mask, i, dir)];
+                let exit = if dir == 0 { paths[i].end } else { paths[i].start };
+                let c = dp[idx(full_mask, i, dir)]
+                    + exit_target.map_or(0.0, |t| dist(exit, t));
                 if c < best_cost { best_cost = c; best_i = i; best_dir = dir; }
             }
         }
