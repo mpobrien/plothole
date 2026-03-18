@@ -56,7 +56,7 @@ impl PlotRenderer {
         acceleration: f64,
         cornering: f64,
     ) -> Self {
-        let flat = optimize_path_order(grouped);
+        let flat = optimize_path_order(grouped, 0.1 / 0.3528);
         let profile = AccelerationProfile { maximum_velocity: max_velocity, acceleration, cornering_factor: cornering };
         build_timeline(flat, &profile)
     }
@@ -320,7 +320,31 @@ impl PlotRenderer {
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
-fn optimize_path_order(grouped: Vec<Vec<Path<f64>>>) -> Vec<Path<f64>> {
+/// Merge consecutive strokes whose endpoints are within `tol` of each other
+/// into a single continuous path, avoiding unnecessary pen-up/down between them.
+fn chain_merge_strokes(strokes: Vec<Path<f64>>, tol: f64) -> Vec<Path<f64>> {
+    if strokes.is_empty() { return strokes; }
+    let mut result: Vec<Path<f64>> = Vec::new();
+    let mut current: Vec<Vec2d<f64>> = strokes[0].points().clone();
+
+    for stroke in strokes.into_iter().skip(1) {
+        let pts = stroke.points();
+        if pts.is_empty() { continue; }
+        let last  = current.last().unwrap().clone();
+        let first = pts[0].clone();
+        let dist  = ((last.x - first.x).powi(2) + (last.y - first.y).powi(2)).sqrt();
+        if dist <= tol {
+            current.extend_from_slice(&pts[1..]);
+        } else {
+            result.push(Path::new(current));
+            current = pts.clone();
+        }
+    }
+    result.push(Path::new(current));
+    result
+}
+
+fn optimize_path_order(grouped: Vec<Vec<Path<f64>>>, merge_tol: f64) -> Vec<Path<f64>> {
     // Pre-filter so we can index ahead to the next non-empty group.
     let groups: Vec<Vec<Path<f64>>> = grouped.into_iter()
         .map(|g| g.into_iter().filter(|p| !p.points().is_empty()).collect::<Vec<_>>())
@@ -355,11 +379,18 @@ fn optimize_path_order(grouped: Vec<Vec<Path<f64>>>) -> Vec<Path<f64>> {
             NearestNeighbor.optimize(&endpoints, pen, exit_target)
         };
 
-        for o in order {
+        // Collect this group's paths in optimized order, then chain-merge within
+        // the group only — never across group boundaries, so characters can't bleed together.
+        let mut group_out: Vec<Path<f64>> = order.iter().map(|o| {
             let mut pts = group[o.index].points().clone();
             if o.reversed { pts.reverse(); }
-            pen = (pts.last().unwrap().x, pts.last().unwrap().y);
-            result.push(Path::new(pts));
+            Path::new(pts)
+        }).collect();
+        group_out = chain_merge_strokes(group_out, merge_tol);
+
+        for path in group_out {
+            pen = { let last = path.points().last().unwrap(); (last.x, last.y) };
+            result.push(path);
         }
     }
     result

@@ -21,6 +21,7 @@ struct PreviewApp {
     start: Option<Instant>,
     width: u32,
     height: u32,
+    done: bool, // true once the final complete frame has been rendered
 }
 
 impl ApplicationHandler for PreviewApp {
@@ -51,7 +52,11 @@ impl ApplicationHandler for PreviewApp {
                 let Some(state) = self.state.as_mut() else { return };
                 let Some(start) = self.start else { return };
 
-                let t = start.elapsed().as_secs_f64().min(self.renderer.duration());
+                let elapsed = start.elapsed().as_secs_f64();
+                let t = elapsed.min(self.renderer.duration());
+                if elapsed >= self.renderer.duration() {
+                    self.done = true;
+                }
                 let w = self.width;
                 let h = self.height;
 
@@ -80,8 +85,8 @@ impl ApplicationHandler for PreviewApp {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(state) = self.state.as_ref() {
-            if let Some(start) = self.start {
-                if start.elapsed().as_secs_f64() < self.renderer.duration() {
+            if self.start.is_some() {
+                if !self.done {
                     state.window.request_redraw();
                 }
             }
@@ -99,6 +104,7 @@ pub fn run(renderer: plothole::PlotRenderer) {
         start: None,
         width: 800,
         height: 500,
+        done: false,
     };
 
     event_loop.run_app(&mut app).unwrap();

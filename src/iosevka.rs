@@ -19,7 +19,8 @@ use crate::font::{Path, Vec2d};
 
 #[derive(Deserialize)]
 struct Meta {
-    upm:          f64,
+    #[allow(dead_code)]
+    upm:          f64, // kept for JSON compatibility
     cell_advance: f64,
     ascender:     f64,
 }
@@ -66,11 +67,14 @@ impl IosevkaFont {
     /// `em_size` is the desired output size in the same units as downstream
     /// coordinates (one em = cap-height, scaled from UPM).
     pub fn text_to_paths(&self, text: &str, em_size: f64) -> Vec<Vec<Path<f64>>> {
-        let upm          = self.skeleton.meta.upm;
+        let ascender     = self.skeleton.meta.ascender;
         let cell_advance = self.skeleton.meta.cell_advance;
-        let scale        = em_size / upm;
+        // em_size is the desired cap height in output path units.
+        // Dividing by ascender (not upm) normalises so that em_size=21 matches
+        // Hershey fonts at scale=1 (~7 mm cap height at MM_PER_UNIT=0.3528).
+        let scale        = em_size / ascender;
         let advance      = cell_advance * scale; // same for every glyph — true monospace
-        let line_height  = self.skeleton.meta.ascender * scale * 1.2;
+        let line_height  = ascender * scale * 1.2; // = em_size * 1.2
 
         let mut result   = Vec::new();
         let mut cursor_x = 0.0f64;

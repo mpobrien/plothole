@@ -30,6 +30,7 @@ struct State {
     pen_up_pos:      i32,
     pen_down_pos:    i32,
     calibrated:      bool,
+    join_tol_mm:     f64,
     suspended_plot:  Option<SuspendedPlot>,
 }
 
@@ -57,6 +58,7 @@ impl State {
             pen_up_pos:      PEN_UP_DEFAULT,
             pen_down_pos: PEN_DOWN_DEFAULT,
             calibrated:      false,
+            join_tol_mm:     0.1,
             suspended_plot:  None,
         }
     }
@@ -149,7 +151,9 @@ fn handle(state: &mut State, line: &str) -> Result<bool, Box<dyn std::error::Err
             println!("  plot <text...>             Plot the given text on the AxiDraw");
             println!("  plot --file <path>         Plot text from a file");
             println!("  continue                   Resume a suspended plot (Esc during plot to suspend)");
+            println!("  join [mm]          Get/set stroke join tolerance (default 0.1 mm)");
             println!("  calibrate          Interactively set pen up/down positions");
+            println!("  raise              Drive pen to servo maximum (clear paper/obstacles)");
             println!("  quit / q           Exit");
         }
 
@@ -170,6 +174,16 @@ fn handle(state: &mut State, line: &str) -> Result<bool, Box<dyn std::error::Err
         "up" => {
             state.device.pen_up()?;
             println!("Pen up");
+        }
+
+        "raise" => {
+            // Drive servo to hardware maximum, then restore calibrated up position
+            // so subsequent pen-up commands still land at the right height.
+            state.device.command(&["SC", "4", &PEN_POS_MAX.to_string()])?;
+            state.device.command(&["SP", "1", "500"])?;
+            std::thread::sleep(Duration::from_millis(600));
+            state.device.command(&["SC", "4", &state.pen_up_pos.to_string()])?;
+            println!("Pen raised to maximum");
         }
 
         "down" => {
@@ -282,7 +296,11 @@ fn handle(state: &mut State, line: &str) -> Result<bool, Box<dyn std::error::Err
                 println!("Iosevka cleared — using Hershey font '{}'", state.font_name);
             } else {
                 state.iosevka_file = Some(parts[1].to_string());
-                println!("Iosevka: {}", parts[1]);
+                // Reset to a default size that keeps movements above the plotter's
+                // minimum threshold. em_size=21 ≈ 7 mm cap height (same as Hershey
+                // at size=1). Use 'size' to adjust.
+                state.font_scale = 21.0;
+                println!("Iosevka: {}  (size reset to 21 — use 'size' to adjust)", parts[1]);
             }
         }
 
@@ -294,6 +312,17 @@ fn handle(state: &mut State, line: &str) -> Result<bool, Box<dyn std::error::Err
                 if s <= 0.0 { return Err("size must be positive".into()); }
                 state.font_scale = s;
                 println!("Size: {}", s);
+            }
+        }
+
+        "join" => {
+            if parts.len() < 2 {
+                println!("Join tolerance: {:.3} mm", state.join_tol_mm);
+            } else {
+                let t: f64 = parts[1].parse()?;
+                if t < 0.0 { return Err("join tolerance must be >= 0".into()); }
+                state.join_tol_mm = t;
+                println!("Join tolerance: {:.3} mm", t);
             }
         }
 
@@ -386,10 +415,7 @@ fn plot_text(state: &mut State, text: &str) -> Result<(), Box<dyn std::error::Er
         crate::scale_grouped(crate::text_to_paths(text, font), state.font_scale)
     };
 
-    let flat = crate::optimize_path_order(grouped);
-    // Merge strokes whose endpoints touch into one continuous path to avoid
-    // unnecessary pen-up/down at corners (tolerance: ~0.18 mm in plotter space).
-    let flat = crate::chain_merge_strokes(flat, 0.5);
+    let flat = crate::optimize_path_order(grouped, state.join_tol_mm / crate::MM_PER_UNIT);
     let strokes: Vec<_> = flat.into_iter().filter(|p| p.points().len() >= 2).collect();
 
     if strokes.is_empty() {
@@ -460,9 +486,9 @@ fn execute_plot(
             if dist_mm > 0.1 {
                 let dur = Duration::from_secs_f64(dist_mm / state.speed_mm_s);
                 state.device.move_mm(dx_mm, dy_mm, dur, state.step_mode)?;
+                cx = pt.x;
+                cy = pt.y;
             }
-            cx = pt.x;
-            cy = pt.y;
         }
 
         pen = { let last = pts.last().unwrap(); (last.x, last.y) };
@@ -475,11 +501,11 @@ fn execute_plot(
 
     terminal::disable_raw_mode()?;
 
-    // Raise pen (whether done or suspended).
-    if pen_is_down {
-        state.device.command(&["SP", "1", "200"])?;
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    // Raise pen to hardware maximum (whether done or suspended).
+    state.device.command(&["SC", "4", &PEN_POS_MAX.to_string()])?;
+    state.device.command(&["SP", "1", "500"])?;
+    std::thread::sleep(Duration::from_millis(600));
+    state.device.command(&["SC", "4", &state.pen_up_pos.to_string()])?;
 
     // Update tracked position by the delta traveled in this session.
     state.position.0 += (pen.0 - start_pen.0) * crate::MM_PER_UNIT;
@@ -613,7 +639,11 @@ struct PersistedState {
     font_name:    String,
     font_scale:   f64,
     iosevka_file: Option<String>,
+    #[serde(default = "default_join_tol_mm")]
+    join_tol_mm:  f64,
 }
+
+fn default_join_tol_mm() -> f64 { 0.1 }
 
 fn state_path() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -638,6 +668,7 @@ fn save_persisted(state: &State) {
         font_name:    state.font_name.clone(),
         font_scale:   state.font_scale,
         iosevka_file: state.iosevka_file.clone(),
+        join_tol_mm:  state.join_tol_mm,
     };
     if let Ok(json) = serde_json::to_string_pretty(&ps) {
         let _ = std::fs::write(state_path(), json);
@@ -657,6 +688,7 @@ pub fn run(device: Device) {
         state.font_name   = ps.font_name;
         state.font_scale  = ps.font_scale;
         state.iosevka_file = ps.iosevka_file;
+        state.join_tol_mm = ps.join_tol_mm;
         if let Some(mode) = parse_step_mode(&ps.step_mode) {
             state.step_mode = mode;
         }

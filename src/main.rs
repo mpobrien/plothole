@@ -34,6 +34,8 @@ use ttf::TtfFont;
 /// The font-unit → mm scale (this constant) is independent of that and must
 /// be determined from a real plot. Placeholder is 1 typographic point ≈ 0.353 mm.
 const MM_PER_UNIT: f64 = 0.3528;
+/// Default join tolerance for CLI commands (0.1 mm in path units).
+const DEFAULT_MERGE_TOL: f64 = 0.1 / MM_PER_UNIT;
 
 use std::{fs::File, ops::Deref};
 
@@ -447,7 +449,7 @@ fn main() {
             };
             if snapshot {
                 let raw = resolve_paths(&text, font_name.as_deref(), ttf_file.as_deref(), iosevka_file.as_deref(), ttf_face, raster_px, dp_epsilon, &ttf_axes, scale);
-                let drawing = Drawing::new(optimize_path_order(raw));
+                let drawing = Drawing::new(optimize_path_order(raw, DEFAULT_MERGE_TOL));
                 animate::render_snapshot(&drawing_to_drawn_paths(&drawing), &output, 800, 500)
                     .expect("snapshot failed");
             } else {
@@ -465,7 +467,7 @@ fn main() {
         Commands::Svg { text, text_file, font_name, ttf_file, iosevka_file, ttf_face, ttf_axes, raster_px, dp_epsilon, scale, output } => {
             let text = resolve_text(text, text_file);
             let raw = resolve_paths(&text, font_name.as_deref(), ttf_file.as_deref(), iosevka_file.as_deref(), ttf_face, raster_px, dp_epsilon, &ttf_axes, scale);
-            let drawing = Drawing::new(optimize_path_order(raw));
+            let drawing = Drawing::new(optimize_path_order(raw, DEFAULT_MERGE_TOL));
             let bounds = drawing.bounding_box();
             let size = bounds.size();
             let margin = 10.0;
@@ -536,7 +538,7 @@ fn main() {
             let original = drawing_to_drawn_paths(&Drawing::new(
                 raw.clone().into_iter().flatten().collect()
             ));
-            let optimized = drawing_to_drawn_paths(&Drawing::new(optimize_path_order(raw)));
+            let optimized = drawing_to_drawn_paths(&Drawing::new(optimize_path_order(raw, DEFAULT_MERGE_TOL)));
             let profile = motion::AccelerationProfile {
                 acceleration,
                 maximum_velocity: max_velocity,
@@ -547,7 +549,7 @@ fn main() {
         Commands::Animate { text, text_file, font_name, ttf_file, iosevka_file, output, fps, width, height, max_velocity, acceleration, cornering, duration, snapshot, ttf_face, ttf_axes, raster_px, dp_epsilon, scale } => {
             let text = resolve_text(text, text_file);
             let raw  = resolve_paths(&text, font_name.as_deref(), ttf_file.as_deref(), iosevka_file.as_deref(), ttf_face, raster_px, dp_epsilon, &ttf_axes, scale);
-            let drawing = Drawing::new(optimize_path_order(raw));
+            let drawing = Drawing::new(optimize_path_order(raw, DEFAULT_MERGE_TOL));
             let paths = drawing_to_drawn_paths(&drawing);
             if snapshot {
                 animate::render_snapshot(&paths, &output, width, height)
@@ -745,7 +747,7 @@ fn chain_merge_strokes(strokes: Vec<Path<f64>>, tol: f64) -> Vec<Path<f64>> {
 
 /// concatenate groups in character order. The pen position carried into each
 /// group is the exit point of the previous group.
-fn optimize_path_order(grouped: Vec<Vec<Path<f64>>>) -> Vec<Path<f64>> {
+fn optimize_path_order(grouped: Vec<Vec<Path<f64>>>, merge_tol: f64) -> Vec<Path<f64>> {
     // Pre-filter so we can index ahead to the next non-empty group.
     let groups: Vec<Vec<Path<f64>>> = grouped.into_iter()
         .map(|g| g.into_iter().filter(|p| !p.points().is_empty()).collect::<Vec<_>>())
@@ -782,12 +784,16 @@ fn optimize_path_order(grouped: Vec<Vec<Path<f64>>>) -> Vec<Path<f64>> {
             optimize::NearestNeighbor.optimize(&endpoints, pen, exit_target)
         };
 
-        for o in order {
+        let mut group_out: Vec<Path<f64>> = order.iter().map(|o| {
             let mut pts = group[o.index].points().clone();
             if o.reversed { pts.reverse(); }
-            let last = pts.last().unwrap();
-            pen = (last.x, last.y);
-            result.push(Path::new(pts));
+            Path::new(pts)
+        }).collect();
+        group_out = chain_merge_strokes(group_out, merge_tol);
+
+        for path in group_out {
+            pen = { let last = path.points().last().unwrap(); (last.x, last.y) };
+            result.push(path);
         }
     }
 
