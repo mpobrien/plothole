@@ -1,2 +1,9 @@
 /target
+/dist
 *.svg
+*.png
+*.gif
+*.curve
+.DS_Store
+nohup.out
+blog.txt

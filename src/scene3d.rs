@@ -160,6 +160,61 @@ pub mod presets {
                     .with_texture(TexturedFace::from_quad(v[3], v[7], v[6], v[2], texture_hatch(0.12, 45.0)));
                 Scene { objects: vec![cube_t] }
             }
+            "text-swarm" => {
+                let n = swarm_count.max(1);
+                let extent = (n as f64 / 1000.0).powf(1.0 / 3.0) * 28.0;
+                let mut state: u64 = 0xC0FFEE_5EED_u64;
+                let mut rand = || -> f64 {
+                    state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                    (state as f64) / (u64::MAX as f64)
+                };
+                // Precompute the 26 letter glyphs once and clone-attach them to each cube.
+                let chars: Vec<char> = ('A'..='Z').collect();
+                let letter_paths: Vec<Vec<Vec<(f64, f64)>>> = chars.iter()
+                    .map(|c| hershey_text_unit_paths(&c.to_string(), "FUTURAL"))
+                    .collect();
+                let mut objs = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let cx = (rand() - 0.5) * 2.0 * extent;
+                    let cy = (rand() - 0.5) * 2.0 * extent;
+                    let cz = (rand() - 0.5) * 2.0 * extent;
+                    let size = 0.8 + rand() * 0.6;
+                    let rx = rand() * 2.0 * std::f64::consts::PI;
+                    let ry = rand() * 2.0 * std::f64::consts::PI;
+                    let rz = rand() * 2.0 * std::f64::consts::PI;
+                    let (sx, cx_) = rx.sin_cos();
+                    let (sy, cy_) = ry.sin_cos();
+                    let (sz, cz_) = rz.sin_cos();
+                    let rotate = |p: Vec3| -> Vec3 {
+                        let p1 = Vec3::new(p.x, cx_ * p.y - sx * p.z, sx * p.y + cx_ * p.z);
+                        let p2 = Vec3::new(cy_ * p1.x + sy * p1.z, p1.y, -sy * p1.x + cy_ * p1.z);
+                        Vec3::new(cz_ * p2.x - sz * p2.y, sz * p2.x + cz_ * p2.y, p2.z)
+                    };
+                    let h = size * 0.5;
+                    let local = [
+                        Vec3::new(-h,-h,-h), Vec3::new( h,-h,-h), Vec3::new( h, h,-h), Vec3::new(-h, h,-h),
+                        Vec3::new(-h,-h, h), Vec3::new( h,-h, h), Vec3::new( h, h, h), Vec3::new(-h, h, h),
+                    ];
+                    let center = Vec3::new(cx, cy, cz);
+                    let v: Vec<Vec3> = local.iter().map(|&p| rotate(p).add(center)).collect();
+                    let faces = vec![
+                        [0,2,1],[0,3,2], [4,5,6],[4,6,7],
+                        [0,1,5],[0,5,4], [2,3,7],[2,7,6],
+                        [0,4,7],[0,7,3], [1,2,6],[1,6,5],
+                    ];
+                    let li = (rand() * chars.len() as f64) as usize % chars.len();
+                    let lp = letter_paths[li].clone();
+                    let mesh = Mesh::new(v.clone(), faces)
+                        .with_texture(TexturedFace::from_quad(v[4], v[5], v[6], v[7], lp.clone())) // +z
+                        .with_texture(TexturedFace::from_quad(v[0], v[3], v[2], v[1], lp.clone())) // -z
+                        .with_texture(TexturedFace::from_quad(v[1], v[2], v[6], v[5], lp.clone())) // +x
+                        .with_texture(TexturedFace::from_quad(v[0], v[4], v[7], v[3], lp.clone())) // -x
+                        .with_texture(TexturedFace::from_quad(v[3], v[7], v[6], v[2], lp.clone())) // +y
+                        .with_texture(TexturedFace::from_quad(v[0], v[1], v[5], v[4], lp));        // -y
+                    objs.push(mesh);
+                }
+                Scene { objects: objs }
+            }
             "text" => {
                 let h = 1.0_f64;
                 let v = [
@@ -177,7 +232,7 @@ pub mod presets {
     }
 
     pub fn names() -> &'static [&'static str] {
-        &["showcase", "cubes", "tower", "mixed", "swarm", "textured", "text"]
+        &["showcase", "cubes", "tower", "mixed", "swarm", "textured", "text", "text-swarm"]
     }
 }
 

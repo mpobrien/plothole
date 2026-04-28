@@ -62,11 +62,16 @@ impl IosevkaFont {
         Ok(Self { skeleton })
     }
 
+    pub fn ascender(&self)     -> f64 { self.skeleton.meta.ascender }
+    pub fn cell_advance(&self) -> f64 { self.skeleton.meta.cell_advance }
+
     /// Returns one `Vec<Path<f64>>` per character in cursor-offset coordinates.
     ///
     /// `em_size` is the desired output size in the same units as downstream
     /// coordinates (one em = cap-height, scaled from UPM).
-    pub fn text_to_paths(&self, text: &str, em_size: f64) -> Vec<Vec<Path<f64>>> {
+    /// `line_gap` is extra space added between lines, in the same path-unit
+    /// coordinates as the output (i.e. already scaled, not in UPM).
+    pub fn text_to_paths(&self, text: &str, em_size: f64, line_gap: f64) -> Vec<Vec<Path<f64>>> {
         let ascender     = self.skeleton.meta.ascender;
         let cell_advance = self.skeleton.meta.cell_advance;
         // em_size is the desired cap height in output path units.
@@ -74,7 +79,7 @@ impl IosevkaFont {
         // Hershey fonts at scale=1 (~7 mm cap height at MM_PER_UNIT=0.3528).
         let scale        = em_size / ascender;
         let advance      = cell_advance * scale; // same for every glyph — true monospace
-        let line_height  = ascender * scale * 1.2; // = em_size * 1.2
+        let line_height  = ascender * scale * 1.2 + line_gap; // = em_size * 1.2 + extra
 
         let mut result   = Vec::new();
         let mut cursor_x = 0.0f64;

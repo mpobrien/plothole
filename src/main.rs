@@ -3,6 +3,7 @@ pub mod font;
 mod animate;
 mod hershey;
 mod preview;
+mod scene3d;
 use crate::font::ToF64;
 use num_traits::{Num, Signed, Zero};
 use std::ops::Add;
@@ -42,7 +43,7 @@ use std::{fs::File, ops::Deref};
 use font::{Path, Vec2d};
 use piet::{
     Color, RenderContext,
-    kurbo::{Line, Size},
+    kurbo::{Line, Rect, Size},
 };
 use piet_svg::RenderContext as SvgRenderContext;
 
@@ -246,6 +247,104 @@ enum Commands {
         output: String,
     },
 
+    /// Lay out sample text on a virtual A4 page and export it as an SVG
+    PrintPage {
+        /// Built-in Hershey font name (see list-fonts); mutually exclusive with --iosevka-file
+        #[arg(long)]
+        font_name: Option<String>,
+
+        /// Path to an Iosevka skeleton.json file; mutually exclusive with --font-name
+        #[arg(long)]
+        iosevka_file: Option<String>,
+
+        /// Target line height in mm (controls font size)
+        #[arg(long, default_value = "7.5")]
+        line_height_mm: f64,
+
+        /// Extra space between lines in mm (added on top of the natural 1.2× line height)
+        #[arg(long, default_value = "0.0")]
+        line_gap_mm: f64,
+
+        /// Page size: a3, a4, a5, or letter  (default: a4)
+        #[arg(long, default_value = "a4")]
+        page_size: String,
+
+        /// Margin on each side of the page in mm
+        #[arg(long, default_value = "20.0")]
+        margin_mm: f64,
+
+        /// Input text (default: lorem ipsum)
+        #[arg(short, long)]
+        text: Option<String>,
+
+        /// Path to a text file (mutually exclusive with --text)
+        #[arg(long)]
+        text_file: Option<String>,
+
+        /// Maximum pen-down speed in mm/s (default ≈ 176 mm/s)
+        #[arg(long, default_value = "176.4")]
+        max_velocity_mm: f64,
+
+        /// Pen acceleration in mm/s²  (default ≈ 706 mm/s²)
+        #[arg(long, default_value = "705.6")]
+        acceleration_mm: f64,
+
+        /// Cornering factor — higher = faster through corners
+        #[arg(long, default_value = "1.0")]
+        cornering: f64,
+
+        /// Pen-up speed multiplier — pen-up moves run this many times faster than pen-down
+        #[arg(long, default_value = "1.0")]
+        pen_up_speed: f64,
+
+        /// Alternate line draw direction (boustrophedon) to eliminate end-of-line returns
+        #[arg(long)]
+        boustrophedon: bool,
+
+        /// Use greedy (first-fit) line breaking instead of DP (Knuth-Plass style)
+        #[arg(long)]
+        greedy_wrap: bool,
+
+        /// Output SVG file path
+        #[arg(short, long, default_value = "page.svg")]
+        output: String,
+    },
+
+    /// Render a 3D scene of primitives (cube/sphere/cylinder/pyramid/prism) with hidden-line removal
+    Scene3d {
+        /// Built-in scene preset: showcase, cubes, tower, mixed
+        #[arg(long, default_value = "showcase")]
+        preset: String,
+
+        /// Page size: a3, a4, a5, or letter
+        #[arg(long, default_value = "a4")]
+        page_size: String,
+
+        /// Page margin in mm
+        #[arg(long, default_value = "20.0")]
+        margin_mm: f64,
+
+        /// Camera azimuth in degrees (rotation around the vertical axis; 0 = +x)
+        #[arg(long, default_value = "35.0")]
+        azimuth: f64,
+
+        /// Camera elevation in degrees (tilt; 0 = level, 90 = top-down)
+        #[arg(long, default_value = "25.0")]
+        elevation: f64,
+
+        /// Vertical field of view in degrees (0 = orthographic; ~60 = wide perspective, ~25 = mild)
+        #[arg(long, default_value = "0.0")]
+        fov: f64,
+
+        /// Camera distance from scene centroid in world units (controls perspective intensity)
+        #[arg(long, default_value = "20.0")]
+        camera_distance: f64,
+
+        /// Output SVG file path
+        #[arg(short, long, default_value = "scene.svg")]
+        output: String,
+    },
+
     /// List available font names
     ListFonts,
     /// List all faces in a TTF/TTC file
@@ -409,7 +508,7 @@ fn resolve_paths(
         (None, None, Some(path)) => {
             IosevkaFont::from_file(path)
                 .expect("failed to load Iosevka skeleton file")
-                .text_to_paths(text, raster_px as f64)
+                .text_to_paths(text, raster_px as f64, 0.0)
                 .into_iter().map(|group| group.into_iter().map(|p| {
                     font::Path::new(p.points().iter()
                         .map(|pt| font::Vec2d { x: pt.x, y: pt.y })
@@ -430,6 +529,61 @@ fn parse_ttf_axis(s: &str) -> Result<(String, f32), String> {
     let value = val.parse::<f32>()
         .map_err(|_| format!("invalid axis value \"{val}\""))?;
     Ok((tag.to_string(), value))
+}
+
+const LOREM_IPSUM: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.\n\nSed ut perspiciatis unde omnis iste natus error sit voluptatem accusantium doloremque laudantium, totam rem aperiam, eaque ipsa quae ab illo inventore veritatis et quasi architecto beatae vitae dicta sunt explicabo. Nemo enim ipsam voluptatem quia voluptas sit aspernatur aut odit aut fugit, sed quia consequuntur magni dolores eos qui ratione voluptatem sequi nesciunt. Neque porro quisquam est, qui dolorem ipsum quia dolor sit amet, consectetur, adipisci velit, sed quia non numquam eius modi tempora incidunt ut labore et dolore magnam aliquam quaerat voluptatem. Ut enim ad minima veniam, quis nostrum exercitationem ullam corporis suscipit laboriosam, nisi ut aliquid ex ea commodi consequatur?\n\nAt vero eos et accusamus et iusto odio dignissimos ducimus qui blanditiis praesentium voluptatum deleniti atque corrupti quos dolores et quas molestias excepturi sint occaecati cupiditate non provident, similique sunt in culpa qui officia deserunt mollitia animi, id est laborum et dolorum fuga. Et harum quidem rerum facilis est et expedita distinctio. Nam libero tempore, cum soluta nobis est eligendi optio cumque nihil impedit quo minus id quod maxime placeat facere possimus, omnis voluptas assumenda est, omnis dolor repellendus. Temporibus autem quibusdam et aut officiis debitis aut rerum necessitatibus saepe eveniet ut et voluptates repudiandae sint et molestiae non recusandae.";
+
+/// Break one paragraph's words into lines using DP (Knuth-Plass style, ragged-right).
+/// Minimises sum of squared slack; the last line of each paragraph is free.
+fn break_paragraph(words: &[&str], max_width: usize) -> Vec<String> {
+    let n = words.len();
+    if n == 0 {
+        return vec![String::new()];
+    }
+    let mut cost = vec![u64::MAX; n + 1];
+    let mut from = vec![0usize; n + 1];
+    cost[n] = 0;
+
+    for i in (0..n).rev() {
+        let mut len = 0usize;
+        for j in i..n {
+            if j > i { len += 1; } // inter-word space
+            len += words[j].len();
+            if len > max_width { break; }
+            let slack = (max_width - len) as u64;
+            let line_cost = if j == n - 1 { 0 } else { slack * slack };
+            let total = line_cost.saturating_add(cost[j + 1]);
+            if total < cost[i] {
+                cost[i] = total;
+                from[i] = j + 1;
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut i = 0;
+    while i < n {
+        let j = from[i];
+        lines.push(words[i..j].join(" "));
+        i = j;
+    }
+    lines
+}
+
+/// Word-wrap `text` to at most `width` characters per line.
+/// Paragraph breaks (blank lines) in the input are preserved.
+/// Uses DP line breaking for even rag.
+fn word_wrap(text: &str, width: usize) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for para in text.split('\n') {
+        let words: Vec<&str> = para.split_whitespace().collect();
+        if words.is_empty() {
+            out.push(String::new()); // preserve blank lines
+        } else {
+            out.extend(break_paragraph(&words, width));
+        }
+    }
+    out.join("\n")
 }
 
 fn main() {
@@ -461,7 +615,13 @@ fn main() {
             cp_view::run(&text, &data, ttf_face, em_px);
         }
         Commands::Control => {
-            let device = device::open_device().expect("failed to open AxiDraw");
+            let device = match device::open_device() {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    eprintln!("Warning: could not open AxiDraw: {e}");
+                    None
+                }
+            };
             tui::run(device);
         }
         Commands::Svg { text, text_file, font_name, ttf_file, iosevka_file, ttf_face, ttf_axes, raster_px, dp_epsilon, scale, output } => {
@@ -477,11 +637,467 @@ fn main() {
             rc.write(out).expect("failed to write SVG");
             println!("Wrote {output}");
         }
+        Commands::PrintPage { font_name, iosevka_file, line_height_mm, line_gap_mm, margin_mm,
+                              page_size, text, text_file, max_velocity_mm, acceleration_mm,
+                              cornering, pen_up_speed, boustrophedon, greedy_wrap, output } => {
+            // Resolve font: exactly one of --font-name or --iosevka-file must be given.
+            // Returns (ascender, avg_advance, text_to_paths_fn).
+            type PathsResult = Vec<Vec<font::Path<f64>>>;
+            let (font_ascender, font_avg_advance, render_text): (f64, f64, Box<dyn Fn(&str, f64, f64) -> PathsResult>) =
+                match (font_name.as_deref(), iosevka_file.as_deref()) {
+                    (Some(name), None) => {
+                        let hf = hershey::fonts()
+                            .get(&name.to_uppercase() as &str)
+                            .unwrap_or_else(|| panic!("unknown font \"{name}\" — run list-fonts to see options"));
+                        let asc = hershey_ascender(hf);
+                        let adv = hershey_avg_advance(hf);
+                        (asc, adv, Box::new(move |t, em, gap| hershey_text_to_paths_scaled(t, hf, em, gap)))
+                    }
+                    (None, Some(path)) => {
+                        let iosevka = IosevkaFont::from_file(path)
+                            .expect("failed to load Iosevka skeleton file");
+                        let asc = iosevka.ascender();
+                        let adv = iosevka.cell_advance();
+                        (asc, adv, Box::new(move |t, em, gap| {
+                            iosevka.text_to_paths(t, em, gap)
+                                .into_iter().map(|group| group.into_iter().map(|p| {
+                                    font::Path::new(p.points().iter()
+                                        .map(|pt| font::Vec2d { x: pt.x, y: pt.y })
+                                        .collect())
+                                }).collect()).collect()
+                        }))
+                    }
+                    _ => panic!("provide exactly one of --font-name or --iosevka-file"),
+                };
+
+            let (page_w_mm, page_h_mm) = match page_size.to_lowercase().as_str() {
+                "a3"     => (297.0_f64, 420.0_f64),
+                "a4"     => (210.0_f64, 297.0_f64),
+                "a5"     => (148.0_f64, 210.0_f64),
+                "letter" => (215.9_f64, 279.4_f64),
+                other    => panic!("unknown page size \"{other}\" — try a3, a4, a5, or letter"),
+            };
+            let pw_mm = page_w_mm - 2.0 * margin_mm;
+            let ph_mm = page_h_mm - 2.0 * margin_mm;
+
+            let em_size    = line_height_mm / (1.2 * MM_PER_UNIT);
+            let line_gap   = line_gap_mm / MM_PER_UNIT; // in path units
+            let scale      = em_size / font_ascender;
+            let advance_mm = font_avg_advance * scale * MM_PER_UNIT;
+
+            let chars_per_line = (pw_mm / advance_mm).floor() as usize;
+            let lines_per_page = (ph_mm / (line_height_mm + line_gap_mm)).floor() as usize;
+
+            let input = match (text, text_file) {
+                (Some(t), None) => t,
+                (None, Some(f)) => std::fs::read_to_string(&f)
+                    .unwrap_or_else(|e| panic!("failed to read text file: {e}")),
+                (None, None)    => LOREM_IPSUM.to_string(),
+                _               => panic!("provide at most one of --text or --text-file"),
+            };
+
+            let wrap = |text: &str| -> String {
+                if greedy_wrap {
+                    // Greedy (first-fit) wrapping
+                    let mut out: Vec<String> = Vec::new();
+                    for para in text.split('\n') {
+                        let mut line = String::new();
+                        for word in para.split_whitespace() {
+                            if line.is_empty() {
+                                line.push_str(word);
+                            } else if line.len() + 1 + word.len() <= chars_per_line {
+                                line.push(' ');
+                                line.push_str(word);
+                            } else {
+                                out.push(line.clone());
+                                line.clear();
+                                line.push_str(word);
+                            }
+                        }
+                        out.push(line);
+                    }
+                    out.join("\n")
+                } else {
+                    word_wrap(text, chars_per_line)
+                }
+            };
+
+            // Tile the input until we have enough wrapped lines to fill the page.
+            let mut tiled = input.clone();
+            while wrap(&tiled).lines().count() < lines_per_page {
+                tiled.push_str(" \n\n");
+                tiled.push_str(&input);
+            }
+            let wrapped   = wrap(&tiled);
+            let page_text = wrapped.lines().take(lines_per_page).collect::<Vec<_>>().join("\n");
+            let placed_lines = page_text.lines().count();
+            let placed_chars: usize = page_text.chars().filter(|&c| c != '\n').count();
+
+            println!("Page:   {page_w_mm}×{page_h_mm} mm ({page_size}), {margin_mm} mm margins → {pw_mm}×{ph_mm} mm printable");
+            println!("Font:   em={em_size:.1} units  cap≈{:.1} mm  advance≈{advance_mm:.2} mm/char  line={line_height_mm:.1} mm",
+                em_size * MM_PER_UNIT);
+            println!("Grid:   {chars_per_line} chars/line × {lines_per_page} lines/page");
+            println!("Text:   {placed_lines} lines, {placed_chars} chars placed");
+
+            let mut raw: Vec<Vec<font::Path<f64>>> = render_text(&page_text, em_size, line_gap);
+            if boustrophedon {
+                let line_lengths: Vec<usize> = page_text.lines()
+                    .map(|l| l.chars().count()).collect();
+                raw = self::boustrophedon(raw, &line_lengths);
+            }
+            let flat    = optimize_path_order(raw, DEFAULT_MERGE_TOL);
+            let drawing = Drawing::new(flat);
+            let bb      = drawing.bounding_box();
+
+            let margin_units = margin_mm / MM_PER_UNIT;
+            let page_w_units = page_w_mm / MM_PER_UNIT;
+            let page_h_units = page_h_mm / MM_PER_UNIT;
+            // Shift so the top of the first line's ascenders sits at the margin.
+            let offset_x = -bb.left + margin_units;
+            let offset_y = -bb.top  + margin_units;
+
+            let mut rc = SvgRenderContext::new(Size::new(page_w_units, page_h_units));
+            rc.clear(None, Color::WHITE);
+            rc.stroke(
+                Rect::new(0.5, 0.5, page_w_units - 0.5, page_h_units - 0.5),
+                &Color::rgb8(180, 180, 180),
+                0.5,
+            );
+            for path in &drawing.paths {
+                let path = match path {
+                    PenPath::PenDown(p) => p,
+                    PenPath::PenUp(_)   => continue,
+                };
+                for seg in path.points().windows(2) {
+                    rc.stroke(
+                        Line::new(
+                            (seg[0].x + offset_x, seg[0].y + offset_y),
+                            (seg[1].x + offset_x, seg[1].y + offset_y),
+                        ),
+                        &Color::BLACK,
+                        1.0,
+                    );
+                }
+            }
+            rc.finish().unwrap();
+            let out = File::create(&output).expect("failed to create SVG");
+            rc.write(out).expect("failed to write SVG");
+            println!("Wrote  {output}");
+
+            let max_vel   = max_velocity_mm / MM_PER_UNIT;
+            let accel     = acceleration_mm / MM_PER_UNIT;
+            let down_profile = motion::AccelerationProfile {
+                maximum_velocity: max_vel,
+                acceleration:     accel,
+                cornering_factor: cornering,
+            };
+            let up_profile = motion::AccelerationProfile {
+                maximum_velocity: max_vel * pen_up_speed,
+                acceleration:     accel  * pen_up_speed,
+                cornering_factor: cornering,
+            };
+            let drawn      = drawing_to_drawn_paths(&drawing);
+            let n_down     = drawn.iter().filter(|p|  p.pen_down).count();
+            let n_up       = drawn.iter().filter(|p| !p.pen_down).count();
+            let t          = plan_duration(&drawn, &down_profile, &up_profile);
+            let opts: Vec<&str> = [
+                (cornering    != 1.0).then_some("cornering"),
+                (pen_up_speed != 1.0).then_some("fast pen-up"),
+                boustrophedon        .then_some("boustrophedon"),
+            ].into_iter().flatten().collect();
+            let opts_str = if opts.is_empty() { "defaults".to_string() } else { opts.join(", ") };
+            println!("Strokes: {n_down} pen-down, {n_up} pen-up");
+            println!("Time:   {t:.0} s  ({:.1} min)  [{opts_str}]", t / 60.0);
+        }
+        Commands::Scene3d { preset, page_size, margin_mm, azimuth, elevation, fov, camera_distance, output } => {
+            use scene3d::{Vec3, Camera, Scene, cube, sphere, cylinder, pyramid, prism, render,
+                          TexturedFace, texture_grid, texture_dots, texture_hatch};
+
+            let (page_w_mm, page_h_mm) = match page_size.to_lowercase().as_str() {
+                "a3"     => (297.0_f64, 420.0_f64),
+                "a4"     => (210.0_f64, 297.0_f64),
+                "a5"     => (148.0_f64, 210.0_f64),
+                "letter" => (215.9_f64, 279.4_f64),
+                other    => panic!("unknown page size \"{other}\""),
+            };
+            let pw_mm = page_w_mm - 2.0 * margin_mm;
+            let ph_mm = page_h_mm - 2.0 * margin_mm;
+
+            let scene = match preset.as_str() {
+                "showcase" => Scene { objects: vec![
+                    cube     (Vec3::new(-3.5, -1.0, 0.0), 2.0),
+                    sphere   (Vec3::new(-1.0,  1.5, 0.5), 1.2, 16, 24),
+                    cylinder (Vec3::new( 1.5, -0.5, 0.0), 1.0, 2.5, 32),
+                    pyramid  (Vec3::new( 4.0,  1.5, 0.0), 2.0, 2.5),
+                    prism    (Vec3::new( 0.5,  3.5, 0.0), 6,   1.2, 1.8),
+                ]},
+                "cubes" => Scene { objects: (0..8).map(|i| {
+                    let r = 1.5 + (i as f64) * 0.3;
+                    let a = i as f64 * 0.7;
+                    cube(Vec3::new(r * a.cos(), r * a.sin(), (i as f64 - 3.5) * 0.4), 1.2)
+                }).collect() },
+                "tower" => Scene { objects: vec![
+                    cube     (Vec3::new(0.0, 0.0, 0.0), 3.0),
+                    cylinder (Vec3::new(0.0, 0.0, 2.5), 1.0, 2.0, 32),
+                    sphere   (Vec3::new(0.0, 0.0, 4.5), 0.9, 16, 24),
+                ]},
+                "swarm" => {
+                    // 1000 cubes at random positions and orientations.
+                    let n      = 1000usize;
+                    let extent = 28.0_f64;
+                    let mut state: u64 = 0xC0FFEE_5EED_u64; // fixed seed → reproducible
+                    let mut rand = || -> f64 {
+                        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
+                        (state as f64) / (u64::MAX as f64)
+                    };
+                    let mut objs = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let cx = (rand() - 0.5) * 2.0 * extent;
+                        let cy = (rand() - 0.5) * 2.0 * extent;
+                        let cz = (rand() - 0.5) * 2.0 * extent;
+                        let size = 0.6 + rand() * 0.8;
+                        // Random Euler-angle rotation (XYZ).
+                        let rx = rand() * 2.0 * std::f64::consts::PI;
+                        let ry = rand() * 2.0 * std::f64::consts::PI;
+                        let rz = rand() * 2.0 * std::f64::consts::PI;
+                        let (sx, cx_) = rx.sin_cos();
+                        let (sy, cy_) = ry.sin_cos();
+                        let (sz, cz_) = rz.sin_cos();
+                        let rotate = |p: Vec3| -> Vec3 {
+                            // Apply Rx, then Ry, then Rz.
+                            let p1 = Vec3::new(p.x, cx_ * p.y - sx * p.z, sx * p.y + cx_ * p.z);
+                            let p2 = Vec3::new(cy_ * p1.x + sy * p1.z, p1.y, -sy * p1.x + cy_ * p1.z);
+                            Vec3::new(cz_ * p2.x - sz * p2.y, sz * p2.x + cz_ * p2.y, p2.z)
+                        };
+                        // Build a cube at origin, rotate, then translate.
+                        let h = size * 0.5;
+                        let local = [
+                            Vec3::new(-h,-h,-h), Vec3::new( h,-h,-h), Vec3::new( h, h,-h), Vec3::new(-h, h,-h),
+                            Vec3::new(-h,-h, h), Vec3::new( h,-h, h), Vec3::new( h, h, h), Vec3::new(-h, h, h),
+                        ];
+                        let center = Vec3::new(cx, cy, cz);
+                        let verts: Vec<Vec3> = local.iter().map(|&p| rotate(p).add(center)).collect();
+                        let faces = vec![
+                            [0,2,1],[0,3,2], [4,5,6],[4,6,7],
+                            [0,1,5],[0,5,4], [2,3,7],[2,7,6],
+                            [0,4,7],[0,7,3], [1,2,6],[1,6,5],
+                        ];
+                        objs.push(scene3d::Mesh::new(verts, faces));
+                    }
+                    Scene { objects: objs }
+                }
+                "mixed" => Scene { objects: vec![
+                    cube    (Vec3::new(-2.0, 0.0, 0.0), 1.8),
+                    sphere  (Vec3::new( 0.0, 0.0, 0.5), 1.0, 14, 22),
+                    pyramid (Vec3::new( 2.5, 0.0, 0.0), 1.6, 2.0),
+                ]},
+                "text" => {
+                    // Helper: render text using a Hershey font, normalize to [0,1]² with y-flipped.
+                    let texture_text = |text: &str, font_name: &str| -> Vec<Vec<(f64, f64)>> {
+                        let ft = hershey::fonts().get(&font_name.to_uppercase() as &str)
+                            .unwrap_or_else(|| panic!("unknown font \"{font_name}\""));
+                        let mut all: Vec<Vec<(f64, f64)>> = text_to_paths(text, ft).into_iter().flatten()
+                            .map(|p| p.points().iter().map(|pt| (pt.x, pt.y)).collect::<Vec<_>>())
+                            .filter(|p| p.len() >= 2)
+                            .collect();
+                        if all.is_empty() { return all; }
+                        let mut min_x = f64::INFINITY; let mut max_x = f64::NEG_INFINITY;
+                        let mut min_y = f64::INFINITY; let mut max_y = f64::NEG_INFINITY;
+                        for p in &all { for &(x, y) in p {
+                            if x < min_x { min_x = x; } if x > max_x { max_x = x; }
+                            if y < min_y { min_y = y; } if y > max_y { max_y = y; }
+                        }}
+                        let w = max_x - min_x;
+                        let h = max_y - min_y;
+                        let s = 0.85 / w.max(h);
+                        let cx = (min_x + max_x) * 0.5;
+                        let cy = (min_y + max_y) * 0.5;
+                        for p in all.iter_mut() { for pt in p.iter_mut() {
+                            pt.0 = 0.5 + (pt.0 - cx) * s;
+                            pt.1 = 0.5 - (pt.1 - cy) * s; // flip y so text reads upright on the face
+                        }}
+                        all
+                    };
+                    let h = 1.0_f64;
+                    let v = [
+                        Vec3::new(-h,-h,-h), Vec3::new( h,-h,-h), Vec3::new( h, h,-h), Vec3::new(-h, h,-h),
+                        Vec3::new(-h,-h, h), Vec3::new( h,-h, h), Vec3::new( h, h, h), Vec3::new(-h, h, h),
+                    ];
+                    let cube_t = cube(Vec3::zero(), 2.0)
+                        .with_texture(TexturedFace::from_quad( // +z top
+                            v[4], v[5], v[6], v[7], texture_text("HELLO", "FUTURAL")))
+                        .with_texture(TexturedFace::from_quad( // +x right
+                            v[1], v[2], v[6], v[5], texture_text("PLOT", "ROWMANT")))
+                        .with_texture(TexturedFace::from_quad( // +y back
+                            v[3], v[7], v[6], v[2], texture_text("HOLE", "GOTHGRT")));
+                    Scene { objects: vec![cube_t] }
+                }
+                "textured" => {
+                    // A cube with a different texture on each visible face.
+                    let h = 1.0_f64; // half-size
+                    // Cube vertices (matches the cube() builder layout).
+                    let verts = [
+                        Vec3::new(-h,-h,-h), Vec3::new( h,-h,-h), Vec3::new( h, h,-h), Vec3::new(-h, h,-h),
+                        Vec3::new(-h,-h, h), Vec3::new( h,-h, h), Vec3::new( h, h, h), Vec3::new(-h, h, h),
+                    ];
+                    // Build the cube mesh, then attach textured faces (CCW from outside).
+                    let textured_cube = cube(Vec3::zero(), 2.0)
+                        .with_texture(TexturedFace::from_quad(
+                            verts[4], verts[5], verts[6], verts[7], texture_grid(6, 6))) // +z top
+                        .with_texture(TexturedFace::from_quad(
+                            verts[1], verts[2], verts[6], verts[5], texture_dots(5, 5, 0.06))) // +x right
+                        .with_texture(TexturedFace::from_quad(
+                            verts[3], verts[7], verts[6], verts[2], texture_hatch(0.12, 45.0))); // +y back
+                    Scene { objects: vec![textured_cube] }
+                }
+                other => panic!("unknown preset \"{other}\" — try showcase, cubes, tower, mixed"),
+            };
+
+            // Camera: orbit around the origin at given azimuth/elevation, look at the centroid of all vertices.
+            let centroid = {
+                let mut c = Vec3::zero();
+                let mut n = 0;
+                for m in &scene.objects {
+                    for v in &m.vertices { c = c.add(*v); n += 1; }
+                }
+                if n == 0 { c } else { c.scale(1.0 / n as f64) }
+            };
+            let az_r = azimuth.to_radians();
+            let el_r = elevation.to_radians();
+            let eye = Vec3::new(
+                centroid.x + camera_distance * el_r.cos() * az_r.cos(),
+                centroid.y + camera_distance * el_r.cos() * az_r.sin(),
+                centroid.z + camera_distance * el_r.sin(),
+            );
+            // Provisional scale; recomputed below to fit page.
+            let cam = Camera { eye, target: centroid, up: Vec3::new(0.0, 0.0, 1.0), scale: 1.0, fov_deg: fov, near: 0.1 };
+
+            // Auto-fit: project at scale 1, find world-space extent on page, pick a scale that fills the printable area.
+            // Use 5–95 percentiles instead of full min/max so a few near-plane vertices that project huge
+            // don't dominate the bounding box.
+            let forward_unit = cam.target.sub(cam.eye).normalize();
+            let mut xs: Vec<f64> = Vec::new();
+            let mut ys: Vec<f64> = Vec::new();
+            for m in &scene.objects {
+                for v in &m.vertices {
+                    let depth = v.sub(cam.eye).dot(forward_unit);
+                    if depth < cam.near { continue; }
+                    let (x, y, _) = cam.project(*v);
+                    xs.push(x); ys.push(y);
+                }
+            }
+            if xs.is_empty() {
+                println!("All vertices behind the near plane — try a larger --camera-distance.");
+                return;
+            }
+            xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            // Robust bbox via IQR: keep min/max of all values that are within 5×IQR of the quartiles.
+            // Filters streak-endpoint outliers without trimming legitimate edge content.
+            let robust_bbox = |sorted: &[f64]| -> (f64, f64) {
+                let n = sorted.len();
+                let q1 = sorted[n / 4];
+                let q3 = sorted[3 * n / 4];
+                let iqr = q3 - q1;
+                let lo = q1 - 5.0 * iqr;
+                let hi = q3 + 5.0 * iqr;
+                let lo_v = sorted.iter().find(|&&v| v >= lo).copied().unwrap_or(sorted[0]);
+                let hi_v = sorted.iter().rev().find(|&&v| v <= hi).copied().unwrap_or(sorted[n - 1]);
+                (lo_v, hi_v)
+            };
+            let (min_x, max_x) = robust_bbox(&xs);
+            let (min_y, max_y) = robust_bbox(&ys);
+            let world_w = max_x - min_x;
+            let world_h = max_y - min_y;
+            let pw_units = pw_mm / MM_PER_UNIT;
+            let ph_units = ph_mm / MM_PER_UNIT;
+            let scale_fit = (pw_units / world_w).min(ph_units / world_h) * 0.95;
+            let cam = Camera { eye, target: centroid, up: Vec3::new(0.0, 0.0, 1.0), scale: scale_fit, fov_deg: fov, near: 0.1 };
+
+            let t0 = std::time::Instant::now();
+            let paths = render(&scene, &cam);
+            let render_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+            // Bounding-box recentered to the page margin.
+            // Path-coord bbox via the same IQR robust trim, so streak endpoints don't bias centering.
+            let mut path_xs: Vec<f64> = Vec::new();
+            let mut path_ys: Vec<f64> = Vec::new();
+            for p in &paths { for pt in p.points() { path_xs.push(pt.x); path_ys.push(pt.y); } }
+            path_xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            path_ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let (bb_min, bb_max) = if path_xs.is_empty() {
+                ((0.0, 0.0), (1.0, 1.0))
+            } else {
+                let (lo_x, hi_x) = robust_bbox(&path_xs);
+                let (lo_y, hi_y) = robust_bbox(&path_ys);
+                ((lo_x, lo_y), (hi_x, hi_y))
+            };
+            let _ = margin_mm; // margin already baked into the auto-fit scale
+            let page_w_units = page_w_mm / MM_PER_UNIT;
+            let page_h_units = page_h_mm / MM_PER_UNIT;
+            let draw_w = bb_max.0 - bb_min.0;
+            let draw_h = bb_max.1 - bb_min.1;
+            let offset_x = -bb_min.0 + (page_w_units - draw_w) * 0.5;
+            let offset_y = -bb_min.1 + (page_h_units - draw_h) * 0.5;
+
+            // Liang-Barsky 2D segment clip against the page rect.
+            let clip_to_rect = |a: (f64, f64), b: (f64, f64)| -> Option<((f64, f64), (f64, f64))> {
+                let (xmin, ymin) = (0.0_f64, 0.0_f64);
+                let (xmax, ymax) = (page_w_units, page_h_units);
+                let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+                let dx = b.0 - a.0;
+                let dy = b.1 - a.1;
+                for &(p, q) in &[(-dx, a.0 - xmin), (dx, xmax - a.0), (-dy, a.1 - ymin), (dy, ymax - a.1)] {
+                    if p.abs() < 1e-12 {
+                        if q < 0.0 { return None; }
+                    } else {
+                        let r = q / p;
+                        if p < 0.0 { if r > t1 { return None; } if r > t0 { t0 = r; } }
+                        else        { if r < t0 { return None; } if r < t1 { t1 = r; } }
+                    }
+                }
+                Some(((a.0 + t0 * dx, a.1 + t0 * dy), (a.0 + t1 * dx, a.1 + t1 * dy)))
+            };
+
+            let mut rc = SvgRenderContext::new(Size::new(page_w_units, page_h_units));
+            rc.clear(None, Color::WHITE);
+            rc.stroke(
+                Rect::new(0.5, 0.5, page_w_units - 0.5, page_h_units - 0.5),
+                &Color::rgb8(180, 180, 180),
+                0.5,
+            );
+            for path in &paths {
+                let pts = path.points();
+                if pts.len() < 2 { continue; }
+                for w in pts.windows(2) {
+                    let p0 = (w[0].x + offset_x, w[0].y + offset_y);
+                    let p1 = (w[1].x + offset_x, w[1].y + offset_y);
+                    if let Some((c0, c1)) = clip_to_rect(p0, p1) {
+                        rc.stroke(Line::new(c0, c1), &Color::BLACK, 1.0);
+                    }
+                }
+            }
+            rc.finish().unwrap();
+            let out = File::create(&output).expect("failed to create SVG");
+            rc.write(out).expect("failed to write SVG");
+            println!("Scene:  {} objects, {} segments  ({render_ms:.1} ms)", scene.objects.len(), paths.len());
+            println!("Wrote   {output}");
+        }
         Commands::ListFonts => {
-            let mut names: Vec<String> = hershey::fonts().keys().cloned().collect();
-            names.sort();
-            for name in names {
-                println!("{}", name);
+            let fonts = hershey::fonts();
+            let mut rows: Vec<(String, f64, f64)> = fonts.iter().map(|(name, ft)| {
+                let asc = hershey_ascender(ft);
+                let adv = hershey_avg_advance(ft);
+                // scale to default 7.5mm line height
+                let em_size = 7.5 / (1.2 * MM_PER_UNIT);
+                let scale   = em_size / asc;
+                let adv_mm  = adv * scale * MM_PER_UNIT;
+                (name.clone(), adv_mm, asc)
+            }).collect();
+            rows.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            println!("{:<14} {:>12}  {:>10}", "FONT", "adv mm/char", "ascender");
+            for (name, adv_mm, asc) in &rows {
+                println!("{:<14} {:>11.2}   {:>9.1}", name, adv_mm, asc);
             }
         }
         Commands::ListFaces { ttf_file } => {
@@ -575,14 +1191,38 @@ fn path_length(points: &[(f64, f64)]) -> f64 {
     }).sum()
 }
 
-fn plan_duration(paths: &[animate::DrawnPath], profile: &motion::AccelerationProfile) -> f64 {
+fn plan_duration(
+    paths:    &[animate::DrawnPath],
+    down:     &motion::AccelerationProfile,
+    up:       &motion::AccelerationProfile,
+) -> f64 {
     paths.iter().filter(|p| p.points.len() >= 2).map(|p| {
+        let profile = if p.pen_down { down } else { up };
         let vec2d: Vec<motion::Vec2d> = p.points.iter()
             .map(|&(x, y)| motion::Vec2d::new(x, y))
             .collect();
         motion::plan_path(&vec2d, profile).duration()
     }).sum()
 }
+
+/// Reverse the character-group order for every other line (boustrophedon / snake order).
+/// Odd lines are reversed so the pen travels right-to-left, eliminating end-of-line returns.
+fn boustrophedon(groups: Vec<Vec<font::Path<f64>>>, line_lengths: &[usize]) -> Vec<Vec<font::Path<f64>>> {
+    let mut result = Vec::with_capacity(groups.len());
+    let mut i = 0;
+    for (line_idx, &len) in line_lengths.iter().enumerate() {
+        let end = (i + len).min(groups.len());
+        let chunk = &groups[i..end];
+        if line_idx % 2 == 1 {
+            result.extend(chunk.iter().cloned().rev());
+        } else {
+            result.extend(chunk.iter().cloned());
+        }
+        i = end;
+    }
+    result
+}
+
 
 fn inspect(
     original: &[animate::DrawnPath],
@@ -616,8 +1256,8 @@ fn inspect(
     let total_opt  = length_drawn + penup_opt;
 
     let t0 = std::time::Instant::now();
-    let time_orig = plan_duration(original, profile);
-    let time_opt  = plan_duration(optimized, profile);
+    let time_orig = plan_duration(original, profile, profile);
+    let time_opt  = plan_duration(optimized, profile, profile);
     let plan_time = t0.elapsed();
 
     let optimizer_name = if n_pen_down <= optimize::HELD_KARP_LIMIT {
@@ -849,6 +1489,62 @@ fn hershey_line_height(ft: &font::Font) -> f64 {
     }
     if min_y > max_y { return 32.0; }
     (max_y - min_y) as f64 * 1.2
+}
+
+/// Height of ascenders above the baseline (|min_y| across all glyphs).
+fn hershey_ascender(ft: &font::Font) -> f64 {
+    let min_y = ft.iter()
+        .flat_map(|g| g.paths.iter())
+        .flat_map(|p| p.points().iter())
+        .map(|pt| pt.y)
+        .min()
+        .unwrap_or(-9);
+    (-min_y).max(1) as f64
+}
+
+/// Average advance width across printable ASCII glyphs (native Hershey units).
+fn hershey_avg_advance(ft: &font::Font) -> f64 {
+    let n = ft.len().min(95); // space through ~
+    if n == 0 { return 16.0; }
+    ft[..n].iter().map(|g| (g.right - g.left) as f64).sum::<f64>() / n as f64
+}
+
+/// Render `text` using a Hershey font, scaled so the ascender height equals `em_size`
+/// output units. Lines are spaced `em_size * 1.2 + line_gap` apart (same formula as
+/// `IosevkaFont::text_to_paths`) so the layout math in `print-page` stays consistent.
+fn hershey_text_to_paths_scaled(
+    text:     &str,
+    ft:       &font::Font,
+    em_size:  f64,
+    line_gap: f64,
+) -> Vec<Vec<font::Path<f64>>> {
+    let ascender    = hershey_ascender(ft);
+    let scale       = em_size / ascender;
+    let line_height = em_size * 1.2 + line_gap;
+
+    let mut result  = Vec::new();
+    let mut line_y  = 0.0f64;
+
+    for (line_idx, line) in text.split('\n').enumerate() {
+        if line_idx > 0 { line_y += line_height; }
+        let mut cursor_x = 0.0f64;
+        for ch in line.chars() {
+            let index = (ch as usize).wrapping_sub(32);
+            if index >= ft.len() { continue; }
+            let glyph   = &ft[index];
+            let advance = (glyph.right - glyph.left) as f64 * scale;
+            let paths: Vec<font::Path<f64>> = glyph.paths.iter()
+                .filter(|p| p.points().len() >= 2)
+                .map(|path| font::Path::new(path.points().iter().map(|pt| font::Vec2d {
+                    x: cursor_x + (pt.x - glyph.left) as f64 * scale,
+                    y: line_y   + pt.y as f64 * scale,
+                }).collect()))
+                .collect();
+            result.push(paths);
+            cursor_x += advance;
+        }
+    }
+    result
 }
 
 enum PenPath<T>

@@ -3,6 +3,7 @@ pub mod hershey;
 pub mod iosevka;
 pub mod motion;
 pub mod optimize;
+pub mod scene3d;
 pub mod ttf;
 
 use font::{Font, Path, Vec2d};
@@ -83,6 +84,15 @@ impl PlotRenderer {
         Ok(Self::from_grouped(grouped, DEFAULT_MAX_VELOCITY, DEFAULT_ACCELERATION, DEFAULT_CORNERING))
     }
 
+    /// Render text using the embedded Iosevka skeleton font.
+    /// `em_size` controls glyph cap-height in path units; line breaking on `\n`.
+    pub fn new_iosevka(text: &str, em_size: f64) -> Result<Self, String> {
+        const SKELETON_JSON: &str = include_str!("../assets/iosevka_skeleton.json");
+        let font = iosevka::IosevkaFont::from_json(SKELETON_JSON).map_err(|e| e.to_string())?;
+        let grouped = font.text_to_paths(text, em_size, 0.0);
+        Ok(Self::from_grouped(grouped, DEFAULT_MAX_VELOCITY, DEFAULT_ACCELERATION, DEFAULT_CORNERING))
+    }
+
     pub fn duration(&self) -> f64 { self.total_duration }
 }
 
@@ -104,6 +114,136 @@ pub fn js_list_fonts() -> Vec<String> {
     let mut names: Vec<String> = hershey::fonts().keys().cloned().collect();
     names.sort();
     names
+}
+
+/// Returns the available 3D scene preset names.
+#[cfg(feature = "wasm")]
+#[wasm_bindgen(js_name = listScene3dPresets)]
+pub fn js_list_scene3d_presets() -> Vec<String> {
+    scene3d::presets::names().iter().map(|s| s.to_string()).collect()
+}
+
+/// Cached 3D scene. Construct once per (preset, count) and call `render` for each
+/// camera change to avoid rebuilding the scene on every slider tick.
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+pub struct Scene3d {
+    scene:    scene3d::Scene,
+    centroid: scene3d::Vec3,
+}
+
+#[cfg(feature = "wasm")]
+#[wasm_bindgen]
+impl Scene3d {
+    #[wasm_bindgen(constructor)]
+    pub fn new(preset: &str, swarm_count: u32) -> Result<Scene3d, JsValue> {
+        let scene = scene3d::presets::build(preset, swarm_count as usize)
+            .map_err(|e| JsValue::from_str(&e))?;
+        let mut c = scene3d::Vec3::zero();
+        let mut n = 0;
+        for m in &scene.objects { for v in &m.vertices { c = c.add(*v); n += 1; } }
+        let centroid = if n == 0 { c } else { c.scale(1.0 / n as f64) };
+        Ok(Scene3d { scene, centroid })
+    }
+
+    /// Render with the given camera params and draw to the canvas.
+    pub fn render(
+        &self,
+        canvas:          &HtmlCanvasElement,
+        azimuth_deg:     f64,
+        elevation_deg:   f64,
+        fov_deg:         f64,
+        camera_distance: f64,
+    ) -> Result<u32, JsValue> {
+        use wasm_bindgen::JsCast;
+        use scene3d::{Vec3, Camera, render};
+
+        let az_r = azimuth_deg.to_radians();
+        let el_r = elevation_deg.to_radians();
+        let eye = Vec3::new(
+            self.centroid.x + camera_distance * el_r.cos() * az_r.cos(),
+            self.centroid.y + camera_distance * el_r.cos() * az_r.sin(),
+            self.centroid.z + camera_distance * el_r.sin(),
+        );
+        let cam = Camera {
+            eye, target: self.centroid, up: Vec3::new(0.0, 0.0, 1.0),
+            scale: 1.0, fov_deg, near: 0.1,
+        };
+        let paths = render(&self.scene, &cam);
+
+    // Robust IQR-based bbox over all path coords (drops streak outliers).
+    let mut xs: Vec<f64> = Vec::new();
+    let mut ys: Vec<f64> = Vec::new();
+    for p in &paths { for pt in p.points() { xs.push(pt.x); ys.push(pt.y); } }
+    if xs.is_empty() { return Ok(0); }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let robust_bbox = |sorted: &[f64]| -> (f64, f64) {
+        let n = sorted.len();
+        let q1 = sorted[n / 4];
+        let q3 = sorted[3 * n / 4];
+        let iqr = q3 - q1;
+        let lo = sorted.iter().find(|&&v| v >= q1 - 5.0 * iqr).copied().unwrap_or(sorted[0]);
+        let hi = sorted.iter().rev().find(|&&v| v <= q3 + 5.0 * iqr).copied().unwrap_or(sorted[n - 1]);
+        (lo, hi)
+    };
+    let (min_x, max_x) = robust_bbox(&xs);
+    let (min_y, max_y) = robust_bbox(&ys);
+
+    // Auto-fit to canvas.
+    let ctx: web_sys::CanvasRenderingContext2d = canvas
+        .get_context("2d").unwrap().unwrap()
+        .dyn_into().unwrap();
+    let cw = canvas.width()  as f64;
+    let ch = canvas.height() as f64;
+    let pad = 16.0;
+    let world_w = (max_x - min_x).max(1e-9);
+    let world_h = (max_y - min_y).max(1e-9);
+    let s = ((cw - 2.0 * pad) / world_w).min((ch - 2.0 * pad) / world_h);
+    let off_x = pad + (cw - 2.0 * pad - world_w * s) / 2.0 - min_x * s;
+    let off_y = pad + (ch - 2.0 * pad - world_h * s) / 2.0 - min_y * s;
+
+    // Liang-Barsky clip to the canvas rect.
+    let clip_to_rect = |a: (f64, f64), b: (f64, f64)| -> Option<((f64, f64), (f64, f64))> {
+        let (xmin, ymin) = (0.0, 0.0);
+        let (xmax, ymax) = (cw, ch);
+        let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+        let dx = b.0 - a.0; let dy = b.1 - a.1;
+        for &(p, q) in &[(-dx, a.0 - xmin), (dx, xmax - a.0), (-dy, a.1 - ymin), (dy, ymax - a.1)] {
+            if p.abs() < 1e-12 { if q < 0.0 { return None; } }
+            else {
+                let r = q / p;
+                if p < 0.0 { if r > t1 { return None; } if r > t0 { t0 = r; } }
+                else        { if r < t0 { return None; } if r < t1 { t1 = r; } }
+            }
+        }
+        Some(((a.0 + t0 * dx, a.1 + t0 * dy), (a.0 + t1 * dx, a.1 + t1 * dy)))
+    };
+
+    ctx.set_fill_style_str("white");
+    ctx.fill_rect(0.0, 0.0, cw, ch);
+    ctx.set_stroke_style_str("#141414");
+    ctx.set_line_width(1.0);
+    ctx.set_line_cap("round");
+
+    let mut drawn = 0u32;
+    ctx.begin_path();
+    for path in &paths {
+        let pts = path.points();
+        if pts.len() < 2 { continue; }
+        for w in pts.windows(2) {
+            let p0 = (w[0].x * s + off_x, w[0].y * s + off_y);
+            let p1 = (w[1].x * s + off_x, w[1].y * s + off_y);
+            if let Some((c0, c1)) = clip_to_rect(p0, p1) {
+                ctx.move_to(c0.0, c0.1);
+                ctx.line_to(c1.0, c1.1);
+                drawn += 1;
+            }
+        }
+    }
+    ctx.stroke();
+    Ok(drawn)
+    }
 }
 
 #[cfg(feature = "wasm")]
@@ -132,6 +272,12 @@ impl PlotRenderer {
             .map_err(|e| JsValue::from_str(&format!("axes_json parse error: {e}")))?;
         Self::new_ttf(font_data, text, face_index, &axes, em_size, dp_epsilon, scale)
             .map_err(|e| JsValue::from_str(&e))
+    }
+
+    /// Construct using the embedded Iosevka skeleton font.
+    #[wasm_bindgen(js_name = fromIosevka)]
+    pub fn js_from_iosevka(text: &str, em_size: f64) -> Result<PlotRenderer, JsValue> {
+        Self::new_iosevka(text, em_size).map_err(|e| JsValue::from_str(&e))
     }
 
     /// Total plotter-time duration in seconds.
@@ -313,6 +459,97 @@ impl PlotRenderer {
         if let Some((cx, cy)) = pen_pos {
             if let Some(dot) = PathBuilder::from_circle(cx, cy, 3.5) {
                 pixmap.fill_path(&dot, &dot_paint, FillRule::Winding, Transform::identity(), None);
+            }
+        }
+    }
+
+    /// Like `render_frame_native` but draws the full motion path including pen-up
+    /// travels, with colored dots at each lift/touch point.
+    ///
+    /// - Pen-down strokes: dark ink
+    /// - Pen-up travels: light blue
+    /// - Pen-touch dots (pen down): green
+    /// - Pen-lift dots (pen up): orange
+    #[cfg(feature = "native")]
+    pub fn render_preview_native(&self, pixmap: &mut tiny_skia::PixmapMut) {
+        use tiny_skia::*;
+
+        let width  = pixmap.width()  as f64;
+        let height = pixmap.height() as f64;
+
+        pixmap.fill(Color::WHITE);
+
+        let padding = 20.0_f64;
+        let draw_w  = (self.max_x - self.min_x).max(1e-9);
+        let draw_h  = (self.max_y - self.min_y).max(1e-9);
+        let scale   = ((width  - 2.0 * padding) / draw_w)
+            .min( (height - 2.0 * padding) / draw_h);
+        let off_x   = padding + (width  - 2.0 * padding - draw_w * scale) / 2.0 - self.min_x * scale;
+        let off_y   = padding + (height - 2.0 * padding - draw_h * scale) / 2.0 - self.min_y * scale;
+
+        let to_px = |x: f64, y: f64| -> (f32, f32) {
+            ((x * scale + off_x) as f32, (y * scale + off_y) as f32)
+        };
+
+        let mut ink_paint = Paint::default();
+        ink_paint.set_color_rgba8(20, 20, 20, 255);
+        ink_paint.anti_alias = true;
+        let mut ink_stroke = Stroke::default();
+        ink_stroke.width = 1.5;
+
+        let mut up_paint = Paint::default();
+        up_paint.set_color_rgba8(100, 160, 220, 180);
+        up_paint.anti_alias = true;
+        let mut up_stroke = Stroke::default();
+        up_stroke.width = 0.8;
+
+        let mut touch_paint = Paint::default();  // pen-down start: green
+        touch_paint.set_color_rgba8(30, 160, 60, 220);
+        touch_paint.anti_alias = true;
+
+        let mut lift_paint = Paint::default();   // pen-up start: orange
+        lift_paint.set_color_rgba8(220, 110, 20, 220);
+        lift_paint.anti_alias = true;
+
+        let dot_r = (scale * draw_w.min(draw_h) * 0.012).clamp(2.0, 6.0) as f32;
+
+        for (i, seg) in self.timeline.iter().enumerate() {
+            if seg.points.len() < 2 { continue; }
+
+            let (paint, stroke) = if seg.pen_down {
+                (&ink_paint, &ink_stroke)
+            } else {
+                (&up_paint, &up_stroke)
+            };
+
+            let mut pb = PathBuilder::new();
+            let (fx, fy) = to_px(seg.points[0].0, seg.points[0].1);
+            pb.move_to(fx, fy);
+            for &(x, y) in &seg.points[1..] {
+                let (px, py) = to_px(x, y);
+                pb.line_to(px, py);
+            }
+            if let Some(path) = pb.finish() {
+                pixmap.stroke_path(&path, paint, stroke, Transform::identity(), None);
+            }
+
+            // At a pen-down transition (previous segment was pen-up, this is pen-down):
+            // draw a green dot at the touch point.
+            // At a pen-up transition (previous segment was pen-down, this is pen-up):
+            // draw an orange dot at the lift point.
+            let prev_pen_down = i > 0 && self.timeline[i - 1].pen_down;
+            let dot_paint = if seg.pen_down && !prev_pen_down {
+                Some(&touch_paint)
+            } else if !seg.pen_down && prev_pen_down {
+                Some(&lift_paint)
+            } else {
+                None
+            };
+            if let Some(dp) = dot_paint {
+                let (cx, cy) = to_px(seg.points[0].0, seg.points[0].1);
+                if let Some(dot) = PathBuilder::from_circle(cx, cy, dot_r) {
+                    pixmap.fill_path(&dot, dp, FillRule::Winding, Transform::identity(), None);
+                }
             }
         }
     }

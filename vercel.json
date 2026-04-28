@@ -1,0 +1,5 @@
+{
+  "buildCommand": "bash build.sh",
+  "outputDirectory": "dist",
+  "installCommand": "echo no-op"
+}
