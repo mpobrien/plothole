@@ -3,12 +3,17 @@
 # and stages the static files into ./dist for deployment.
 set -euo pipefail
 
-if ! command -v rustc >/dev/null 2>&1; then
+# Always install via rustup. Vercel ships a system rustc (without rustup, no wasm32 target),
+# so we ignore it and put $HOME/.cargo/bin first on PATH to override.
+if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
   echo ">>> installing rustup"
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-    | sh -s -- -y --default-toolchain stable --profile minimal
+    | sh -s -- -y --default-toolchain stable --profile minimal --target wasm32-unknown-unknown
 fi
 export PATH="$HOME/.cargo/bin:$PATH"
+
+# Idempotent — no-op if already added.
+rustup target add wasm32-unknown-unknown
 
 if ! command -v wasm-pack >/dev/null 2>&1; then
   echo ">>> installing wasm-pack"
