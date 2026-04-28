@@ -386,6 +386,7 @@ fn handle(state: &mut State, line: &str) -> Result<bool, Box<dyn std::error::Err
                         plothole::DEFAULT_MAX_VELOCITY,
                         plothole::DEFAULT_ACCELERATION,
                         plothole::DEFAULT_CORNERING,
+                        1.0,
                     ))
                     .map_err(|e| e.to_string())
             } else {
@@ -481,6 +482,7 @@ fn terminal_preview(state: &State, text: &str) -> Result<(), Box<dyn std::error:
                 plothole::DEFAULT_MAX_VELOCITY,
                 plothole::DEFAULT_ACCELERATION,
                 plothole::DEFAULT_CORNERING,
+                1.0,
             ))
             .map_err(|e| e.to_string())
     } else {

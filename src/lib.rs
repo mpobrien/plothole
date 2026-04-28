@@ -51,15 +51,19 @@ pub struct PlotRenderer {
 // ── Core constructors (no wasm-bindgen, callable from native Rust too) ────────
 
 impl PlotRenderer {
+    /// `pen_up_speed` multiplies max-velocity and acceleration for pen-up segments only.
+    /// Use 1.0 to disable; higher values let the pen rocket between strokes.
     pub fn from_grouped(
         grouped: Vec<Vec<Path<f64>>>,
         max_velocity: f64,
         acceleration: f64,
         cornering: f64,
+        pen_up_speed: f64,
     ) -> Self {
         let flat = optimize_path_order(grouped, 0.1 / 0.3528);
-        let profile = AccelerationProfile { maximum_velocity: max_velocity, acceleration, cornering_factor: cornering };
-        build_timeline(flat, &profile)
+        let down = AccelerationProfile { maximum_velocity: max_velocity,                acceleration,                              cornering_factor: cornering };
+        let up   = AccelerationProfile { maximum_velocity: max_velocity * pen_up_speed, acceleration: acceleration * pen_up_speed, cornering_factor: cornering };
+        build_timeline(flat, &down, &up)
     }
 
     pub fn new_hershey(text: &str, font_name: &str, scale: f64) -> Result<Self, String> {
@@ -67,7 +71,7 @@ impl PlotRenderer {
         let font = fonts.get(&font_name.to_uppercase() as &str)
             .ok_or_else(|| format!("unknown font \"{font_name}\""))?;
         let grouped = scale_grouped(hershey_text_to_paths(text, font), scale);
-        Ok(Self::from_grouped(grouped, DEFAULT_MAX_VELOCITY, DEFAULT_ACCELERATION, DEFAULT_CORNERING))
+        Ok(Self::from_grouped(grouped, DEFAULT_MAX_VELOCITY, DEFAULT_ACCELERATION, DEFAULT_CORNERING, 1.0))
     }
 
     pub fn new_ttf(
@@ -81,7 +85,7 @@ impl PlotRenderer {
     ) -> Result<Self, String> {
         let font = TtfFont::from_bytes(font_data, face_index).map_err(|e| e.to_string())?;
         let grouped = scale_grouped(font.text_to_paths(text, em_size, dp_epsilon, axes), scale);
-        Ok(Self::from_grouped(grouped, DEFAULT_MAX_VELOCITY, DEFAULT_ACCELERATION, DEFAULT_CORNERING))
+        Ok(Self::from_grouped(grouped, DEFAULT_MAX_VELOCITY, DEFAULT_ACCELERATION, DEFAULT_CORNERING, 1.0))
     }
 
     /// Render text using the embedded Iosevka skeleton font.
@@ -90,7 +94,7 @@ impl PlotRenderer {
         const SKELETON_JSON: &str = include_str!("../assets/iosevka_skeleton.json");
         let font = iosevka::IosevkaFont::from_json(SKELETON_JSON).map_err(|e| e.to_string())?;
         let grouped = font.text_to_paths(text, em_size, 0.0);
-        Ok(Self::from_grouped(grouped, DEFAULT_MAX_VELOCITY, DEFAULT_ACCELERATION, DEFAULT_CORNERING))
+        Ok(Self::from_grouped(grouped, DEFAULT_MAX_VELOCITY, DEFAULT_ACCELERATION, DEFAULT_CORNERING, 1.0))
     }
 
     pub fn duration(&self) -> f64 { self.total_duration }
@@ -171,10 +175,13 @@ impl Scene3d {
         elevation_deg:   f64,
         fov_deg:         f64,
         camera_distance: f64,
+        max_velocity:    f64,
+        acceleration:    f64,
+        cornering:       f64,
+        pen_up_speed:    f64,
     ) -> PlotRenderer {
         let paths = self.build_paths(azimuth_deg, elevation_deg, fov_deg, camera_distance);
-        // Wrap in a single group; optimizer reorders to minimise pen-up travel.
-        PlotRenderer::from_grouped(vec![paths], DEFAULT_MAX_VELOCITY, DEFAULT_ACCELERATION, DEFAULT_CORNERING)
+        PlotRenderer::from_grouped(vec![paths], max_velocity, acceleration, cornering, pen_up_speed)
     }
 
     /// Render with the given camera params and draw to the canvas.
@@ -666,8 +673,9 @@ fn make_segment(points: Vec<(f64, f64)>, pen_down: bool, start_time: f64, profil
     Segment { pen_down, points, plan, seg_starts, total_length: cum, start_time }
 }
 
-/// Convert flat optimized paths into a timeline with interleaved pen-up moves.
-fn build_timeline(flat: Vec<Path<f64>>, profile: &AccelerationProfile) -> PlotRenderer {
+/// Convert flat optimized paths into a timeline with interleaved pen-up moves,
+/// applying separate motion profiles for pen-down strokes vs. pen-up travels.
+fn build_timeline(flat: Vec<Path<f64>>, down: &AccelerationProfile, up: &AccelerationProfile) -> PlotRenderer {
     let mut min_x = f64::INFINITY;
     let mut min_y = f64::INFINITY;
     let mut max_x = f64::NEG_INFINITY;
@@ -691,7 +699,7 @@ fn build_timeline(flat: Vec<Path<f64>>, profile: &AccelerationProfile) -> PlotRe
         // Pen-up travel to path start.
         if pen != start {
             let up_pts = vec![pen, start];
-            let seg = make_segment(up_pts, false, current_time, profile);
+            let seg = make_segment(up_pts, false, current_time, up);
             current_time += seg.plan.duration();
             timeline.push(seg);
         }
@@ -699,7 +707,7 @@ fn build_timeline(flat: Vec<Path<f64>>, profile: &AccelerationProfile) -> PlotRe
         // Pen-down stroke.
         let pts: Vec<(f64, f64)> = path.points().iter().map(|v| (v.x, v.y)).collect();
         pen = *pts.last().unwrap();
-        let seg = make_segment(pts, true, current_time, profile);
+        let seg = make_segment(pts, true, current_time, down);
         current_time += seg.plan.duration();
         timeline.push(seg);
     }

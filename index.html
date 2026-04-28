@@ -52,8 +52,15 @@
       <label class="slider">Distance <span class="val" id="distance-val">20</span>
         <input id="distance" type="range" min="2" max="60" step="0.5" value="20"></label>
     </div>
+    <div class="controls">
+      <label>Max vel <input id="max-vel"   type="number" value="500"  min="50"  max="5000" step="50"  style="width: 70px;"></label>
+      <label>Accel <input id="accel"     type="number" value="2000" min="100" max="10000" step="100" style="width: 70px;"></label>
+      <label>Cornering <input id="cornering" type="number" value="1.0"  min="0.1" max="10"   step="0.1" style="width: 60px;"></label>
+      <label>Pen-up speed× <input id="pen-up" type="number" value="1.0" min="1" max="10" step="0.5" style="width: 50px;"></label>
+    </div>
     <div class="controls" style="font-size: 11px; color: #888;">
       <span id="scene-stats">—</span>
+      <span id="plot-stats" style="margin-left: 12px;"></span>
     </div>
   </div>
 
@@ -217,18 +224,38 @@
         scenePlotRaf = null;
       }
     }
+    const maxVelInp    = document.getElementById('max-vel');
+    const accelInp     = document.getElementById('accel');
+    const corneringInp = document.getElementById('cornering');
+    const penUpInp     = document.getElementById('pen-up');
+    const plotStats    = document.getElementById('plot-stats');
     document.getElementById('scene-show-plot').addEventListener('click', () => {
       ensureScene();
       const az  = parseFloat(azInp.value);
       const el  = parseFloat(elInp.value);
       const fov = parseFloat(fovInp.value);
       const d   = parseFloat(distInp.value);
+      const vmax  = parseFloat(maxVelInp.value)    || 500;
+      const accel = parseFloat(accelInp.value)     || 2000;
+      const corn  = parseFloat(corneringInp.value) || 1.0;
+      const upMul = parseFloat(penUpInp.value)     || 1.0;
       if (scenePlotRaf) { cancelAnimationFrame(scenePlotRaf); }
       if (scenePlotRenderer) { scenePlotRenderer.free(); }
-      scenePlotRenderer = sceneCtx.toPlotRenderer(az, el, fov, d);
+      const t0 = performance.now();
+      scenePlotRenderer = sceneCtx.toPlotRenderer(az, el, fov, d, vmax, accel, corn, upMul);
+      const planMs   = performance.now() - t0;
+      const plotSecs = scenePlotRenderer.duration();
+      plotStats.textContent = `Plot: ${plotSecs.toFixed(1)} s (${(plotSecs / 60).toFixed(2)} min) · plan ${planMs.toFixed(0)} ms`;
       scenePlotStart = null;
       scenePlotRaf = requestAnimationFrame(frameScenePlot);
     });
+    // Re-estimate when motion params change but a plot has already been built.
+    for (const el of [maxVelInp, accelInp, corneringInp, penUpInp]) {
+      el.addEventListener('input', () => {
+        // Don't auto-replan — user clicks Show Plot to refresh.
+        plotStats.textContent = '(motion params changed — click Show Plot to update)';
+      });
+    }
   </script>
 </body>
 </html>
