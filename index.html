@@ -40,6 +40,7 @@
     <div class="controls">
       <label>Preset: <select id="scene-preset"></select></label>
       <label>Cubes: <input id="scene-count" type="number" value="200" min="1" max="2000" step="50" style="width: 70px;"></label>
+      <button id="scene-show-plot">Show Plot</button>
     </div>
     <div class="controls">
       <label class="slider">Azimuth <span class="val" id="azimuth-val">35°</span>
@@ -190,9 +191,44 @@
     }
 
     for (const el of [presetSel, countInp, azInp, elInp, fovInp, distInp]) {
-      el.addEventListener('input', scheduleRender);
+      el.addEventListener('input', () => {
+        // Cancel any in-progress plot animation when the user touches a control.
+        if (scenePlotRaf) { cancelAnimationFrame(scenePlotRaf); scenePlotRaf = null; }
+        if (scenePlotRenderer) { scenePlotRenderer.free(); scenePlotRenderer = null; }
+        scheduleRender();
+      });
     }
     scheduleRender();
+
+    // ─── 3D scene plot animation ──────────────────────────────────────────
+    let scenePlotRenderer = null;
+    let scenePlotStart    = null;
+    let scenePlotRaf      = null;
+    const PLOT_PLAYBACK_SECONDS = 12;
+    function frameScenePlot(ts) {
+      if (!scenePlotStart) scenePlotStart = ts;
+      const dur     = scenePlotRenderer.duration();
+      const elapsed = (ts - scenePlotStart) / 1000;
+      const t       = Math.min(elapsed * (dur / PLOT_PLAYBACK_SECONDS), dur);
+      scenePlotRenderer.renderFrame(sceneCanvas, t);
+      if (t < dur) {
+        scenePlotRaf = requestAnimationFrame(frameScenePlot);
+      } else {
+        scenePlotRaf = null;
+      }
+    }
+    document.getElementById('scene-show-plot').addEventListener('click', () => {
+      ensureScene();
+      const az  = parseFloat(azInp.value);
+      const el  = parseFloat(elInp.value);
+      const fov = parseFloat(fovInp.value);
+      const d   = parseFloat(distInp.value);
+      if (scenePlotRaf) { cancelAnimationFrame(scenePlotRaf); }
+      if (scenePlotRenderer) { scenePlotRenderer.free(); }
+      scenePlotRenderer = sceneCtx.toPlotRenderer(az, el, fov, d);
+      scenePlotStart = null;
+      scenePlotRaf = requestAnimationFrame(frameScenePlot);
+    });
   </script>
 </body>
 </html>

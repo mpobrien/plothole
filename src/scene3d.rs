@@ -85,11 +85,12 @@ pub mod presets {
     pub fn build(name: &str, swarm_count: usize) -> Result<Scene, String> {
         Ok(match name {
             "showcase" => Scene { objects: vec![
-                cube     (Vec3::new(-3.5, -1.0, 0.0), 2.0),
-                sphere   (Vec3::new(-1.0,  1.5, 0.5), 1.2, 16, 24),
-                cylinder (Vec3::new( 1.5, -0.5, 0.0), 1.0, 2.5, 32),
-                pyramid  (Vec3::new( 4.0,  1.5, 0.0), 2.0, 2.5),
-                prism    (Vec3::new( 0.5,  3.5, 0.0), 6,   1.2, 1.8),
+                cube         (Vec3::new(-3.5, -1.0, 0.0), 2.0),
+                sphere       (Vec3::new(-1.0,  1.5, 0.5), 1.2, 16, 24),
+                cylinder     (Vec3::new( 1.5, -0.5, 0.0), 1.0, 2.5, 32),
+                pyramid      (Vec3::new( 4.0,  1.5, 0.0), 2.0, 2.5),
+                prism        (Vec3::new( 0.5,  3.5, 0.0), 6,   1.2, 1.8),
+                dodecahedron (Vec3::new(-3.0,  3.0, 0.5), 1.3),
             ]},
             "cubes" => Scene { objects: (0..8).map(|i| {
                 let r = 1.5 + (i as f64) * 0.3;
@@ -105,6 +106,13 @@ pub mod presets {
                 cube    (Vec3::new(-2.0, 0.0, 0.0), 1.8),
                 sphere  (Vec3::new( 0.0, 0.0, 0.5), 1.0, 14, 22),
                 pyramid (Vec3::new( 2.5, 0.0, 0.0), 1.6, 2.0),
+            ]},
+            "shapes" => Scene { objects: vec![
+                house        (Vec3::new(-3.5, -1.0, 0.0), 2.0),
+                frustum      (Vec3::new(-1.0,  1.5, 0.5), 2.4, 1.0, 2.0),
+                wedge        (Vec3::new( 1.5, -0.5, 0.0), 2.0),
+                octahedron   (Vec3::new( 4.0,  1.5, 0.5), 1.4),
+                dodecahedron (Vec3::new( 0.5,  3.5, 0.5), 1.4),
             ]},
             "swarm" => {
                 let n = swarm_count.max(1);
@@ -232,7 +240,7 @@ pub mod presets {
     }
 
     pub fn names() -> &'static [&'static str] {
-        &["showcase", "cubes", "tower", "mixed", "swarm", "textured", "text", "text-swarm"]
+        &["showcase", "cubes", "tower", "mixed", "shapes", "swarm", "textured", "text", "text-swarm"]
     }
 }
 
@@ -389,6 +397,156 @@ impl Mesh {
         self.textured_faces.push(face);
         self
     }
+
+    /// Build a mesh from polygon faces. Each polygon is a list of vertex indices in
+    /// CCW order viewed from outside; polygons must be planar. Each polygon is
+    /// fan-triangulated from its first vertex. The internal triangulation diagonals
+    /// fall on coplanar adjacent triangles, so they're classified as smooth and
+    /// won't render — only the polygon's actual edges show up as creases.
+    pub fn from_polygons(vertices: Vec<Vec3>, polygons: Vec<Vec<usize>>) -> Self {
+        let mut faces: Vec<[usize; 3]> = Vec::new();
+        for poly in &polygons {
+            if poly.len() < 3 { continue; }
+            for i in 1..poly.len() - 1 {
+                faces.push([poly[0], poly[i], poly[i + 1]]);
+            }
+        }
+        Self::new(vertices, faces)
+    }
+}
+
+/// A simple house shape: a 2×2×1 box with a gabled roof on top.
+/// Demonstrates non-rectangular faces (the gable walls are pentagons, the bottom and roof slopes are quads).
+pub fn house(center: Vec3, size: f64) -> Mesh {
+    let h = size * 0.5;
+    let v = vec![
+        Vec3::new(-h,-h,    0.0), Vec3::new( h,-h,    0.0), Vec3::new( h, h,    0.0), Vec3::new(-h, h,    0.0), // 0..3 base
+        Vec3::new(-h,-h,      h), Vec3::new( h,-h,      h), Vec3::new( h, h,      h), Vec3::new(-h, h,      h), // 4..7 eaves
+        Vec3::new(0.0,-h, 2.0*h), Vec3::new(0.0, h, 2.0*h),                                                       // 8..9 ridge ends
+    ].into_iter().map(|p| p.add(center)).collect();
+    let polygons = vec![
+        vec![0, 3, 2, 1],          // bottom (-z)
+        vec![1, 2, 6, 5],          // east wall (+x)
+        vec![0, 4, 7, 3],          // west wall (-x)
+        vec![0, 1, 5, 8, 4],       // south gable (-y)
+        vec![2, 3, 7, 9, 6],       // north gable (+y)
+        vec![5, 6, 9, 8],          // east roof slope
+        vec![4, 8, 9, 7],          // west roof slope
+    ];
+    Mesh::from_polygons(v, polygons)
+}
+
+/// Truncated square pyramid (frustum). `base` and `top` are the side lengths of
+/// the bottom and top squares; `height` is the vertical extent.
+pub fn frustum(center: Vec3, base: f64, top: f64, height: f64) -> Mesh {
+    let bh = base * 0.5;
+    let th = top * 0.5;
+    let zh = height * 0.5;
+    let v = vec![
+        Vec3::new(-bh,-bh,-zh), Vec3::new( bh,-bh,-zh), Vec3::new( bh, bh,-zh), Vec3::new(-bh, bh,-zh), // 0..3 bottom
+        Vec3::new(-th,-th, zh), Vec3::new( th,-th, zh), Vec3::new( th, th, zh), Vec3::new(-th, th, zh), // 4..7 top
+    ].into_iter().map(|p| p.add(center)).collect();
+    let polygons = vec![
+        vec![0, 3, 2, 1],     // bottom
+        vec![4, 5, 6, 7],     // top
+        vec![0, 1, 5, 4],     // -y
+        vec![1, 2, 6, 5],     // +x
+        vec![2, 3, 7, 6],     // +y
+        vec![3, 0, 4, 7],     // -x
+    ];
+    Mesh::from_polygons(v, polygons)
+}
+
+/// A right-triangular prism (wedge) with hypotenuse running from +x bottom to -x top.
+pub fn wedge(center: Vec3, size: f64) -> Mesh {
+    let h = size * 0.5;
+    let v = vec![
+        Vec3::new(-h,-h,-h), Vec3::new( h,-h,-h), Vec3::new(-h,-h, h), // 0..2 south triangle
+        Vec3::new(-h, h,-h), Vec3::new( h, h,-h), Vec3::new(-h, h, h), // 3..5 north triangle
+    ].into_iter().map(|p| p.add(center)).collect();
+    let polygons = vec![
+        vec![0, 1, 2],          // south wall (-y)
+        vec![4, 3, 5],          // north wall (+y)
+        vec![0, 3, 4, 1],       // bottom (-z)
+        vec![0, 2, 5, 3],       // back wall (-x)
+        vec![1, 4, 5, 2],       // hypotenuse / slanted face
+    ];
+    Mesh::from_polygons(v, polygons)
+}
+
+/// Regular octahedron — 8 triangular faces, 6 vertices.
+pub fn octahedron(center: Vec3, radius: f64) -> Mesh {
+    let r = radius;
+    let v = vec![
+        Vec3::new( r, 0.0, 0.0), Vec3::new(-r, 0.0, 0.0),  // 0,1: ±x
+        Vec3::new(0.0,  r, 0.0), Vec3::new(0.0, -r, 0.0),  // 2,3: ±y
+        Vec3::new(0.0, 0.0,  r), Vec3::new(0.0, 0.0, -r),  // 4,5: ±z
+    ].into_iter().map(|p| p.add(center)).collect();
+    let polygons = vec![
+        vec![4, 0, 2], vec![4, 2, 1], vec![4, 1, 3], vec![4, 3, 0],  // top half (around +z apex)
+        vec![5, 2, 0], vec![5, 1, 2], vec![5, 3, 1], vec![5, 0, 3],  // bottom half (around -z apex)
+    ];
+    Mesh::from_polygons(v, polygons)
+}
+
+/// Regular dodecahedron with circumradius `radius` (distance from center to vertex).
+/// Uses 12 pentagonal faces — a real workout for the polygon-face pipeline.
+pub fn dodecahedron(center: Vec3, radius: f64) -> Mesh {
+    let phi     = (1.0 + 5.0_f64.sqrt()) / 2.0;
+    let inv_phi = 1.0 / phi;
+    let s       = radius / 3.0_f64.sqrt(); // place cube vertices on a sphere of radius `radius`
+
+    // 20 vertices: 8 cube corners + 12 "rectangle" vertices.
+    let mut v: Vec<Vec3> = Vec::new();
+    for &sx in &[ s, -s] { for &sy in &[ s, -s] { for &sz in &[ s, -s] {
+        v.push(Vec3::new(sx, sy, sz));
+    }}}
+    for &y in &[ s * inv_phi, -s * inv_phi] {
+        for &z in &[ s * phi, -s * phi] { v.push(Vec3::new(0.0, y, z)); }
+    }
+    for &x in &[ s * inv_phi, -s * inv_phi] {
+        for &y in &[ s * phi, -s * phi] { v.push(Vec3::new(x, y, 0.0)); }
+    }
+    for &x in &[ s * phi, -s * phi] {
+        for &z in &[ s * inv_phi, -s * inv_phi] { v.push(Vec3::new(x, 0.0, z)); }
+    }
+
+    // 12 face-normal directions (= dual icosahedron vertices).
+    // For this vertex layout the faces actually point at (0,±φ,±1), (±φ,±1,0), (±1,0,±φ)
+    // — y/z swapped from the more common icosahedron convention.
+    let face_dirs: Vec<Vec3> = {
+        let mut d = Vec::with_capacity(12);
+        for &y in &[phi, -phi] { for &z in &[1.0, -1.0] { d.push(Vec3::new(0.0, y, z)); }}
+        for &x in &[phi, -phi] { for &y in &[1.0, -1.0] { d.push(Vec3::new(x, y, 0.0)); }}
+        for &x in &[1.0, -1.0] { for &z in &[phi, -phi] { d.push(Vec3::new(x, 0.0, z)); }}
+        d
+    };
+
+    // For each face direction, pick the 5 vertices with highest dot product, then
+    // sort them CCW by angle in a 2D basis on the face plane.
+    let mut polygons: Vec<Vec<usize>> = Vec::with_capacity(12);
+    for nd in &face_dirs {
+        let n = nd.normalize();
+        let mut by_dot: Vec<(usize, f64)> = (0..v.len()).map(|i| (i, v[i].dot(n))).collect();
+        by_dot.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let face: Vec<usize> = by_dot[..5].iter().map(|&(i, _)| i).collect();
+
+        // CCW sort around centroid
+        let centroid = face.iter().fold(Vec3::zero(), |acc, &i| acc.add(v[i])).scale(0.2);
+        // pick any reference vector not parallel to n
+        let raw_u = if n.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
+        let u = raw_u.sub(n.scale(raw_u.dot(n))).normalize();
+        let v_axis = n.cross(u);
+        let mut sorted: Vec<(usize, f64)> = face.iter().map(|&i| {
+            let r = v[i].sub(centroid);
+            (i, r.dot(v_axis).atan2(r.dot(u)))
+        }).collect();
+        sorted.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        polygons.push(sorted.into_iter().map(|(i, _)| i).collect());
+    }
+
+    let translated = v.into_iter().map(|p| p.add(center)).collect();
+    Mesh::from_polygons(translated, polygons)
 }
 
 // ── Built-in texture generators (paths in unit-square coords) ──────────────

@@ -146,6 +146,37 @@ impl Scene3d {
         Ok(Scene3d { scene, centroid })
     }
 
+    /// Build the camera and run the hidden-line render pipeline. Internal helper.
+    fn build_paths(&self, az_deg: f64, el_deg: f64, fov_deg: f64, distance: f64) -> Vec<Path<f64>> {
+        use scene3d::{Vec3, Camera, render};
+        let az_r = az_deg.to_radians();
+        let el_r = el_deg.to_radians();
+        let eye = Vec3::new(
+            self.centroid.x + distance * el_r.cos() * az_r.cos(),
+            self.centroid.y + distance * el_r.cos() * az_r.sin(),
+            self.centroid.z + distance * el_r.sin(),
+        );
+        let cam = Camera {
+            eye, target: self.centroid, up: Vec3::new(0.0, 0.0, 1.0),
+            scale: 1.0, fov_deg, near: 0.1,
+        };
+        render(&self.scene, &cam)
+    }
+
+    /// Convert the rendered 3D scene to a `PlotRenderer` so the plotter motion can be animated.
+    #[wasm_bindgen(js_name = toPlotRenderer)]
+    pub fn js_to_plot_renderer(
+        &self,
+        azimuth_deg:     f64,
+        elevation_deg:   f64,
+        fov_deg:         f64,
+        camera_distance: f64,
+    ) -> PlotRenderer {
+        let paths = self.build_paths(azimuth_deg, elevation_deg, fov_deg, camera_distance);
+        // Wrap in a single group; optimizer reorders to minimise pen-up travel.
+        PlotRenderer::from_grouped(vec![paths], DEFAULT_MAX_VELOCITY, DEFAULT_ACCELERATION, DEFAULT_CORNERING)
+    }
+
     /// Render with the given camera params and draw to the canvas.
     pub fn render(
         &self,
@@ -156,20 +187,8 @@ impl Scene3d {
         camera_distance: f64,
     ) -> Result<u32, JsValue> {
         use wasm_bindgen::JsCast;
-        use scene3d::{Vec3, Camera, render};
 
-        let az_r = azimuth_deg.to_radians();
-        let el_r = elevation_deg.to_radians();
-        let eye = Vec3::new(
-            self.centroid.x + camera_distance * el_r.cos() * az_r.cos(),
-            self.centroid.y + camera_distance * el_r.cos() * az_r.sin(),
-            self.centroid.z + camera_distance * el_r.sin(),
-        );
-        let cam = Camera {
-            eye, target: self.centroid, up: Vec3::new(0.0, 0.0, 1.0),
-            scale: 1.0, fov_deg, near: 0.1,
-        };
-        let paths = render(&self.scene, &cam);
+        let paths = self.build_paths(azimuth_deg, elevation_deg, fov_deg, camera_distance);
 
     // Robust IQR-based bbox over all path coords (drops streak outliers).
     let mut xs: Vec<f64> = Vec::new();

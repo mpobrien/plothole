@@ -810,8 +810,7 @@ fn main() {
             println!("Time:   {t:.0} s  ({:.1} min)  [{opts_str}]", t / 60.0);
         }
         Commands::Scene3d { preset, page_size, margin_mm, azimuth, elevation, fov, camera_distance, output } => {
-            use scene3d::{Vec3, Camera, Scene, cube, sphere, cylinder, pyramid, prism, render,
-                          TexturedFace, texture_grid, texture_dots, texture_hatch};
+            use scene3d::{Vec3, Camera, render};
 
             let (page_w_mm, page_h_mm) = match page_size.to_lowercase().as_str() {
                 "a3"     => (297.0_f64, 420.0_f64),
@@ -823,135 +822,9 @@ fn main() {
             let pw_mm = page_w_mm - 2.0 * margin_mm;
             let ph_mm = page_h_mm - 2.0 * margin_mm;
 
-            let scene = match preset.as_str() {
-                "showcase" => Scene { objects: vec![
-                    cube     (Vec3::new(-3.5, -1.0, 0.0), 2.0),
-                    sphere   (Vec3::new(-1.0,  1.5, 0.5), 1.2, 16, 24),
-                    cylinder (Vec3::new( 1.5, -0.5, 0.0), 1.0, 2.5, 32),
-                    pyramid  (Vec3::new( 4.0,  1.5, 0.0), 2.0, 2.5),
-                    prism    (Vec3::new( 0.5,  3.5, 0.0), 6,   1.2, 1.8),
-                ]},
-                "cubes" => Scene { objects: (0..8).map(|i| {
-                    let r = 1.5 + (i as f64) * 0.3;
-                    let a = i as f64 * 0.7;
-                    cube(Vec3::new(r * a.cos(), r * a.sin(), (i as f64 - 3.5) * 0.4), 1.2)
-                }).collect() },
-                "tower" => Scene { objects: vec![
-                    cube     (Vec3::new(0.0, 0.0, 0.0), 3.0),
-                    cylinder (Vec3::new(0.0, 0.0, 2.5), 1.0, 2.0, 32),
-                    sphere   (Vec3::new(0.0, 0.0, 4.5), 0.9, 16, 24),
-                ]},
-                "swarm" => {
-                    // 1000 cubes at random positions and orientations.
-                    let n      = 1000usize;
-                    let extent = 28.0_f64;
-                    let mut state: u64 = 0xC0FFEE_5EED_u64; // fixed seed → reproducible
-                    let mut rand = || -> f64 {
-                        state ^= state << 13; state ^= state >> 7; state ^= state << 17;
-                        (state as f64) / (u64::MAX as f64)
-                    };
-                    let mut objs = Vec::with_capacity(n);
-                    for _ in 0..n {
-                        let cx = (rand() - 0.5) * 2.0 * extent;
-                        let cy = (rand() - 0.5) * 2.0 * extent;
-                        let cz = (rand() - 0.5) * 2.0 * extent;
-                        let size = 0.6 + rand() * 0.8;
-                        // Random Euler-angle rotation (XYZ).
-                        let rx = rand() * 2.0 * std::f64::consts::PI;
-                        let ry = rand() * 2.0 * std::f64::consts::PI;
-                        let rz = rand() * 2.0 * std::f64::consts::PI;
-                        let (sx, cx_) = rx.sin_cos();
-                        let (sy, cy_) = ry.sin_cos();
-                        let (sz, cz_) = rz.sin_cos();
-                        let rotate = |p: Vec3| -> Vec3 {
-                            // Apply Rx, then Ry, then Rz.
-                            let p1 = Vec3::new(p.x, cx_ * p.y - sx * p.z, sx * p.y + cx_ * p.z);
-                            let p2 = Vec3::new(cy_ * p1.x + sy * p1.z, p1.y, -sy * p1.x + cy_ * p1.z);
-                            Vec3::new(cz_ * p2.x - sz * p2.y, sz * p2.x + cz_ * p2.y, p2.z)
-                        };
-                        // Build a cube at origin, rotate, then translate.
-                        let h = size * 0.5;
-                        let local = [
-                            Vec3::new(-h,-h,-h), Vec3::new( h,-h,-h), Vec3::new( h, h,-h), Vec3::new(-h, h,-h),
-                            Vec3::new(-h,-h, h), Vec3::new( h,-h, h), Vec3::new( h, h, h), Vec3::new(-h, h, h),
-                        ];
-                        let center = Vec3::new(cx, cy, cz);
-                        let verts: Vec<Vec3> = local.iter().map(|&p| rotate(p).add(center)).collect();
-                        let faces = vec![
-                            [0,2,1],[0,3,2], [4,5,6],[4,6,7],
-                            [0,1,5],[0,5,4], [2,3,7],[2,7,6],
-                            [0,4,7],[0,7,3], [1,2,6],[1,6,5],
-                        ];
-                        objs.push(scene3d::Mesh::new(verts, faces));
-                    }
-                    Scene { objects: objs }
-                }
-                "mixed" => Scene { objects: vec![
-                    cube    (Vec3::new(-2.0, 0.0, 0.0), 1.8),
-                    sphere  (Vec3::new( 0.0, 0.0, 0.5), 1.0, 14, 22),
-                    pyramid (Vec3::new( 2.5, 0.0, 0.0), 1.6, 2.0),
-                ]},
-                "text" => {
-                    // Helper: render text using a Hershey font, normalize to [0,1]² with y-flipped.
-                    let texture_text = |text: &str, font_name: &str| -> Vec<Vec<(f64, f64)>> {
-                        let ft = hershey::fonts().get(&font_name.to_uppercase() as &str)
-                            .unwrap_or_else(|| panic!("unknown font \"{font_name}\""));
-                        let mut all: Vec<Vec<(f64, f64)>> = text_to_paths(text, ft).into_iter().flatten()
-                            .map(|p| p.points().iter().map(|pt| (pt.x, pt.y)).collect::<Vec<_>>())
-                            .filter(|p| p.len() >= 2)
-                            .collect();
-                        if all.is_empty() { return all; }
-                        let mut min_x = f64::INFINITY; let mut max_x = f64::NEG_INFINITY;
-                        let mut min_y = f64::INFINITY; let mut max_y = f64::NEG_INFINITY;
-                        for p in &all { for &(x, y) in p {
-                            if x < min_x { min_x = x; } if x > max_x { max_x = x; }
-                            if y < min_y { min_y = y; } if y > max_y { max_y = y; }
-                        }}
-                        let w = max_x - min_x;
-                        let h = max_y - min_y;
-                        let s = 0.85 / w.max(h);
-                        let cx = (min_x + max_x) * 0.5;
-                        let cy = (min_y + max_y) * 0.5;
-                        for p in all.iter_mut() { for pt in p.iter_mut() {
-                            pt.0 = 0.5 + (pt.0 - cx) * s;
-                            pt.1 = 0.5 - (pt.1 - cy) * s; // flip y so text reads upright on the face
-                        }}
-                        all
-                    };
-                    let h = 1.0_f64;
-                    let v = [
-                        Vec3::new(-h,-h,-h), Vec3::new( h,-h,-h), Vec3::new( h, h,-h), Vec3::new(-h, h,-h),
-                        Vec3::new(-h,-h, h), Vec3::new( h,-h, h), Vec3::new( h, h, h), Vec3::new(-h, h, h),
-                    ];
-                    let cube_t = cube(Vec3::zero(), 2.0)
-                        .with_texture(TexturedFace::from_quad( // +z top
-                            v[4], v[5], v[6], v[7], texture_text("HELLO", "FUTURAL")))
-                        .with_texture(TexturedFace::from_quad( // +x right
-                            v[1], v[2], v[6], v[5], texture_text("PLOT", "ROWMANT")))
-                        .with_texture(TexturedFace::from_quad( // +y back
-                            v[3], v[7], v[6], v[2], texture_text("HOLE", "GOTHGRT")));
-                    Scene { objects: vec![cube_t] }
-                }
-                "textured" => {
-                    // A cube with a different texture on each visible face.
-                    let h = 1.0_f64; // half-size
-                    // Cube vertices (matches the cube() builder layout).
-                    let verts = [
-                        Vec3::new(-h,-h,-h), Vec3::new( h,-h,-h), Vec3::new( h, h,-h), Vec3::new(-h, h,-h),
-                        Vec3::new(-h,-h, h), Vec3::new( h,-h, h), Vec3::new( h, h, h), Vec3::new(-h, h, h),
-                    ];
-                    // Build the cube mesh, then attach textured faces (CCW from outside).
-                    let textured_cube = cube(Vec3::zero(), 2.0)
-                        .with_texture(TexturedFace::from_quad(
-                            verts[4], verts[5], verts[6], verts[7], texture_grid(6, 6))) // +z top
-                        .with_texture(TexturedFace::from_quad(
-                            verts[1], verts[2], verts[6], verts[5], texture_dots(5, 5, 0.06))) // +x right
-                        .with_texture(TexturedFace::from_quad(
-                            verts[3], verts[7], verts[6], verts[2], texture_hatch(0.12, 45.0))); // +y back
-                    Scene { objects: vec![textured_cube] }
-                }
-                other => panic!("unknown preset \"{other}\" — try showcase, cubes, tower, mixed"),
-            };
+            // Use the shared preset library so the binary and the wasm webapp stay in sync.
+            let scene = scene3d::presets::build(preset.as_str(), 1000)
+                .unwrap_or_else(|e| panic!("{e}"));
 
             // Camera: orbit around the origin at given azimuth/elevation, look at the centroid of all vertices.
             let centroid = {
