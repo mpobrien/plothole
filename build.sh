@@ -7,6 +7,8 @@ set -euo pipefail
 # so we ignore it and put $HOME/.cargo/bin first on PATH to override.
 if [ ! -x "$HOME/.cargo/bin/rustup" ]; then
   echo ">>> installing rustup"
+  # Vercel pre-installs a Rust at /rust; rustup-init refuses unless we tell it to skip the check.
+  export RUSTUP_INIT_SKIP_PATH_CHECK=yes
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain stable --profile minimal --target wasm32-unknown-unknown
 fi
