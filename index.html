@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Plothole</title>
+  <style>
+    body { margin: 0; background: #1a1a1a; display: flex; flex-direction: column; align-items: center; padding: 32px 0; min-height: 100vh; gap: 24px; font-family: monospace; color: #eee; }
+    canvas { background: white; border-radius: 4px; }
+    .panel { display: flex; flex-direction: column; align-items: center; gap: 10px; }
+    .panel h2 { margin: 0; font-size: 14px; font-weight: normal; color: #888; letter-spacing: 1px; }
+    .controls { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; max-width: 800px; justify-content: center; }
+    input, select, button { font-family: monospace; font-size: 14px; padding: 4px 8px; border-radius: 3px; border: 1px solid #555; background: #2a2a2a; color: #eee; }
+    button { cursor: pointer; background: #333; }
+    button:hover { background: #444; }
+    label { font-size: 12px; color: #aaa; display: flex; align-items: center; gap: 4px; }
+    .slider { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; }
+    .slider input[type=range] { width: 140px; }
+    .slider .val { color: #ccc; font-size: 11px; }
+    hr { border: none; border-top: 1px solid #333; width: 100%; max-width: 800px; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h2>TEXT ANIMATION</h2>
+    <canvas id="canvas" width="800" height="500"></canvas>
+    <div class="controls">
+      <label>Text: <input id="text" value="Hello World" size="20"></label>
+      <label>Font: <select id="font"></select></label>
+      <label>TTF file: <input id="ttf" type="file" accept=".ttf,.otf,.ttc"></label>
+      <label>Speed: <input id="duration" type="number" value="10" min="1" max="300" step="1"> s</label>
+      <button id="go">Render</button>
+    </div>
+  </div>
+
+  <hr>
+
+  <div class="panel">
+    <h2>3D SCENE</h2>
+    <canvas id="scene-canvas" width="800" height="600"></canvas>
+    <div class="controls">
+      <label>Preset: <select id="scene-preset"></select></label>
+      <label>Cubes: <input id="scene-count" type="number" value="200" min="1" max="2000" step="50" style="width: 70px;"></label>
+    </div>
+    <div class="controls">
+      <label class="slider">Azimuth <span class="val" id="azimuth-val">35°</span>
+        <input id="azimuth" type="range" min="0" max="360" step="1" value="35"></label>
+      <label class="slider">Elevation <span class="val" id="elevation-val">25°</span>
+        <input id="elevation" type="range" min="-89" max="89" step="1" value="25"></label>
+      <label class="slider">FOV <span class="val" id="fov-val">0°</span>
+        <input id="fov" type="range" min="0" max="120" step="1" value="0"></label>
+      <label class="slider">Distance <span class="val" id="distance-val">20</span>
+        <input id="distance" type="range" min="2" max="60" step="0.5" value="20"></label>
+    </div>
+    <div class="controls" style="font-size: 11px; color: #888;">
+      <span id="scene-stats">—</span>
+    </div>
+  </div>
+
+  <script type="module">
+    import init, { PlotRenderer, listFonts, listScene3dPresets, Scene3d } from './pkg/plothole.js';
+    await init();
+
+    // Populate font dropdown.
+    const fontSel = document.getElementById('font');
+    const defaultFont = 'FUTURAL';
+    {
+      const opt = document.createElement('option');
+      opt.value = 'IOSEVKA';
+      opt.textContent = 'IOSEVKA (skeleton)';
+      fontSel.appendChild(opt);
+    }
+    for (const name of listFonts()) {
+      const opt = document.createElement('option');
+      opt.value = name;
+      opt.textContent = name;
+      if (name === defaultFont) opt.selected = true;
+      fontSel.appendChild(opt);
+    }
+
+    const canvas = document.getElementById('canvas');
+    let renderer = null;
+    let animStart = null;
+    let animDuration = 10;
+    let rafId = null;
+
+    function frame(ts) {
+      if (!animStart) animStart = ts;
+      const t = Math.min((ts - animStart) / 1000 * (renderer.duration() / animDuration), renderer.duration());
+      renderer.renderFrame(canvas, t);
+      if (t < renderer.duration()) {
+        rafId = requestAnimationFrame(frame);
+      }
+    }
+
+    function startAnim() {
+      if (rafId) cancelAnimationFrame(rafId);
+      animStart = null;
+      animDuration = parseFloat(document.getElementById('duration').value) || 10;
+      rafId = requestAnimationFrame(frame);
+    }
+
+    document.getElementById('go').addEventListener('click', async () => {
+      const text = document.getElementById('text').value || 'Hello';
+      const fontName = document.getElementById('font').value;
+      const ttfInput = document.getElementById('ttf');
+      const duration = parseFloat(document.getElementById('duration').value) || 10;
+
+      try {
+        if (ttfInput.files.length > 0) {
+          const buf = await ttfInput.files[0].arrayBuffer();
+          renderer = PlotRenderer.fromTtf(new Uint8Array(buf), text, 0, '[]', 128.0, 1.5);
+        } else if (fontName === 'IOSEVKA') {
+          renderer = PlotRenderer.fromIosevka(text, 30.0);
+        } else {
+          renderer = PlotRenderer.fromHershey(text, fontName || 'FUTURAL', 1.0);
+        }
+        animDuration = duration;
+        startAnim();
+      } catch (e) {
+        alert('Error: ' + e);
+      }
+    });
+
+    // Render immediately on load.
+    try {
+      renderer = PlotRenderer.fromHershey('Hello World', 'FUTURAL', 1.0);
+      startAnim();
+    } catch (e) {
+      console.error(e);
+    }
+
+    // ─── 3D scene ──────────────────────────────────────────────────────────
+    const sceneCanvas = document.getElementById('scene-canvas');
+    const presetSel   = document.getElementById('scene-preset');
+    const countInp    = document.getElementById('scene-count');
+    const azInp       = document.getElementById('azimuth');
+    const elInp       = document.getElementById('elevation');
+    const fovInp      = document.getElementById('fov');
+    const distInp     = document.getElementById('distance');
+    const stats       = document.getElementById('scene-stats');
+    const azVal       = document.getElementById('azimuth-val');
+    const elVal       = document.getElementById('elevation-val');
+    const fovVal      = document.getElementById('fov-val');
+    const distVal     = document.getElementById('distance-val');
+
+    for (const name of listScene3dPresets()) {
+      const opt = document.createElement('option');
+      opt.value = name; opt.textContent = name;
+      if (name === 'showcase') opt.selected = true;
+      presetSel.appendChild(opt);
+    }
+
+    // Scene cache: only rebuilt when preset or count changes.
+    let sceneCtx = null;
+    let cachedKey = '';
+    function ensureScene() {
+      const cnt = Math.max(1, parseInt(countInp.value) || 200);
+      const key = presetSel.value + '|' + cnt;
+      if (key !== cachedKey) {
+        if (sceneCtx) sceneCtx.free();
+        sceneCtx = new Scene3d(presetSel.value, cnt);
+        cachedKey = key;
+      }
+    }
+
+    let pending = false;
+    function scheduleRender() {
+      if (pending) return;
+      pending = true;
+      requestAnimationFrame(() => {
+        pending = false;
+        const az  = parseFloat(azInp.value);
+        const el  = parseFloat(elInp.value);
+        const fov = parseFloat(fovInp.value);
+        const d   = parseFloat(distInp.value);
+        azVal.textContent   = az.toFixed(0) + '°';
+        elVal.textContent   = el.toFixed(0) + '°';
+        fovVal.textContent  = fov.toFixed(0) + '°';
+        distVal.textContent = d.toFixed(1);
+        const t0 = performance.now();
+        try {
+          ensureScene();
+          const n = sceneCtx.render(sceneCanvas, az, el, fov, d);
+          const ms = (performance.now() - t0).toFixed(1);
+          stats.textContent = `${n} segments · ${ms} ms`;
+        } catch (e) {
+          stats.textContent = 'Error: ' + e;
+        }
+      });
+    }
+
+    for (const el of [presetSel, countInp, azInp, elInp, fovInp, distInp]) {
+      el.addEventListener('input', scheduleRender);
+    }
+    scheduleRender();
+  </script>
+</body>
+</html>
