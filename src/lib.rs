@@ -234,7 +234,7 @@ enum FillKind {
     Hatch(Vec<f64>), // angles in degrees
     Dots,
     Zigzag,
-    Waves,
+    Waves { amplitude: Option<f64>, wavelength: Option<f64>, phase_step: f64 },
     Concentric,
     Hex,
     Brick,
@@ -257,7 +257,7 @@ fn parse_fill(v: &serde_json::Value) -> Result<Option<FillSpec>, String> {
                 "crosshatch" => FillKind::Hatch(vec![45.0, 135.0]),
                 "dots"       => FillKind::Dots,
                 "zigzag"     => FillKind::Zigzag,
-                "waves"      => FillKind::Waves,
+                "waves"      => FillKind::Waves { amplitude: None, wavelength: None, phase_step: 180.0 },
                 "concentric" => FillKind::Concentric,
                 "hex"        => FillKind::Hex,
                 "brick"      => FillKind::Brick,
@@ -276,7 +276,22 @@ fn parse_fill(v: &serde_json::Value) -> Result<Option<FillSpec>, String> {
             let kind = match fill_type {
                 "dots"       => FillKind::Dots,
                 "zigzag"     => FillKind::Zigzag,
-                "waves"      => FillKind::Waves,
+                "waves" => {
+                    let parse_len = |key: &str| -> Result<Option<f64>, String> {
+                        match map.get(key) {
+                            None                               => Ok(None),
+                            Some(serde_json::Value::Number(n)) => Ok(Some(n.as_f64().unwrap_or(0.0))),
+                            Some(serde_json::Value::String(s)) => Ok(Some(parse_length_to_units(s)?)),
+                            Some(other) => Err(format!("waves.{key} must be a number or length string, got {other}")),
+                        }
+                    };
+                    let phase_step = match map.get("phase_step") {
+                        None                               => 180.0,
+                        Some(serde_json::Value::Number(n)) => n.as_f64().unwrap_or(180.0),
+                        Some(other) => return Err(format!("waves.phase_step must be a number (degrees), got {other}")),
+                    };
+                    FillKind::Waves { amplitude: parse_len("amplitude")?, wavelength: parse_len("wavelength")?, phase_step }
+                }
                 "concentric" => FillKind::Concentric,
                 "hex"        => FillKind::Hex,
                 "brick"      => FillKind::Brick,
@@ -354,14 +369,19 @@ fn hatch_rect_paths(x0: f64, y0: f64, x1: f64, y1: f64, angle_deg: f64, spacing:
 
 fn dots_rect_paths(x0: f64, y0: f64, x1: f64, y1: f64, spacing: f64) -> Vec<Path<f64>> {
     let mut paths = vec![];
-    let mut y = y0 + spacing * 0.5;
-    while y <= y1 + 1e-9 {
-        let mut x = x0 + spacing * 0.5;
-        while x <= x1 + 1e-9 {
+    // Global grid: dot (j,k) is at ((j+0.5)*spacing, (k+0.5)*spacing).
+    let ky0 = (y0 / spacing).floor() as i64;
+    let ky1 = (y1 / spacing).ceil()  as i64;
+    let kx0 = (x0 / spacing).floor() as i64;
+    let kx1 = (x1 / spacing).ceil()  as i64;
+    for ky in ky0..=ky1 {
+        let y = (ky as f64 + 0.5) * spacing;
+        if y < y0 - 1e-9 || y > y1 + 1e-9 { continue; }
+        for kx in kx0..=kx1 {
+            let x = (kx as f64 + 0.5) * spacing;
+            if x < x0 - 1e-9 || x > x1 + 1e-9 { continue; }
             paths.push(Path::new(vec![Vec2d::new(x, y), Vec2d::new(x, y)]));
-            x += spacing;
         }
-        y += spacing;
     }
     paths
 }
@@ -392,11 +412,14 @@ fn zigzag_rect_paths(x0: f64, y0: f64, x1: f64, y1: f64, spacing: f64) -> Vec<Pa
     let amplitude = spacing * 0.5;
     let tooth_w   = spacing;
     let mut paths = vec![];
-    let mut row   = 0i64;
-    let mut y_c   = y0 + spacing * 0.5;
-    while y_c <= y1 + 1e-9 {
+    // Globally-anchored: row k has center at (k + 0.5) * spacing.
+    // Start from the first k whose row can overlap [y0, y1].
+    let k_start = ((y0 - amplitude) / spacing - 0.5).floor() as i64 + 1;
+    let k_end   = ((y1 + amplitude) / spacing - 0.5).ceil()  as i64;
+    for k in k_start..=k_end {
+        let y_c   = (k as f64 + 0.5) * spacing;
         // Alternate rows offset by half a tooth so peaks of one row meet troughs of the next.
-        let phase    = row.rem_euclid(2) as f64 * tooth_w;
+        let phase    = k.rem_euclid(2) as f64 * tooth_w;
         let i_start  = ((x0 - phase) / tooth_w).floor() as i64;
         let i_end    = ((x1 - phase) / tooth_w).ceil()  as i64;
         let xs: Vec<f64> = (i_start..=i_end).map(|i| phase + i as f64 * tooth_w).collect();
@@ -417,30 +440,32 @@ fn zigzag_rect_paths(x0: f64, y0: f64, x1: f64, y1: f64, spacing: f64) -> Vec<Pa
             pts.push(Vec2d::new(pb.0, pb.1));
         }
         if pts.len() >= 2 { paths.push(Path::new(pts)); }
-        y_c += spacing;
-        row += 1;
     }
     paths
 }
 
-/// Rows of sinusoidal waves; adjacent rows are phase-inverted so they interlock.
-fn waves_rect_paths(x0: f64, y0: f64, x1: f64, y1: f64, spacing: f64) -> Vec<Path<f64>> {
-    let amplitude  = spacing * 0.38;
-    let wavelength = spacing * 2.0;
-    let steps = (((x1 - x0) / spacing * 12.0).ceil() as usize).max(4);
+/// Rows of sinusoidal waves with configurable amplitude, wavelength, and inter-row phase step.
+fn waves_rect_paths(
+    x0: f64, y0: f64, x1: f64, y1: f64, spacing: f64,
+    amplitude: Option<f64>, wavelength: Option<f64>, phase_step: f64,
+) -> Vec<Path<f64>> {
+    let amplitude  = amplitude.unwrap_or(spacing * 0.38);
+    let wavelength = wavelength.unwrap_or(spacing * 2.0);
+    let phase_step_rad = phase_step.to_radians();
+    let steps = (((x1 - x0) / wavelength * 24.0).ceil() as usize).max(4);
+    // Globally-anchored: row k has center at (k + 0.5) * spacing.
+    let k_start = ((y0 - amplitude) / spacing - 0.5).floor() as i64 + 1;
+    let k_end   = ((y1 + amplitude) / spacing - 0.5).ceil()  as i64;
     let mut paths = vec![];
-    let mut row   = 0i64;
-    let mut y_c   = y0 + spacing * 0.5;
-    while y_c <= y1 + 1e-9 {
-        let phase = row.rem_euclid(2) as f64 * std::f64::consts::PI;
+    for k in k_start..=k_end {
+        let y_c   = (k as f64 + 0.5) * spacing;
+        let phase = k as f64 * phase_step_rad;
         let pts: Vec<Vec2d<f64>> = (0..=steps).map(|i| {
             let x = x0 + (x1 - x0) * i as f64 / steps as f64;
             let y = y_c + amplitude * (phase + 2.0 * std::f64::consts::PI * x / wavelength).sin();
             Vec2d::new(x, y.clamp(y0, y1))
         }).collect();
         if pts.len() >= 2 { paths.push(Path::new(pts)); }
-        y_c += spacing;
-        row += 1;
     }
     paths
 }
@@ -477,9 +502,10 @@ fn hex_rect_paths(x0: f64, y0: f64, x1: f64, y1: f64, spacing: f64) -> Vec<Path<
         (-r * sqrt3 / 2.0,  r * 0.5),
     ];
     let mut paths = vec![];
-    let row_end = ((y1 - y0) / sy).ceil() as i64 + 2;
-    for row in -2..=row_end {
-        let cy       = y0 + row as f64 * sy;
+    let row_start = (y0 / sy).floor() as i64 - 1;
+    let row_end   = (y1 / sy).ceil()  as i64 + 1;
+    for row in row_start..=row_end {
+        let cy       = row as f64 * sy;
         let x_offset = if row.rem_euclid(2) == 0 { 0.0 } else { sx * 0.5 };
         let col_start = ((x0 - x_offset) / sx).floor() as i64 - 1;
         let col_end   = ((x1 - x_offset) / sx).ceil()  as i64 + 1;
@@ -502,29 +528,31 @@ fn hex_rect_paths(x0: f64, y0: f64, x1: f64, y1: f64, spacing: f64) -> Vec<Path<
 fn brick_rect_paths(x0: f64, y0: f64, x1: f64, y1: f64, spacing: f64) -> Vec<Path<f64>> {
     let brick_w = spacing * 2.0;
     let brick_h = spacing;
+    // Globally-anchored: mortar line k is at y = k * brick_h; brick row k spans [k*brick_h, (k+1)*brick_h].
+    let k_start = (y0 / brick_h).floor() as i64;
+    let k_end   = (y1 / brick_h).ceil()  as i64;
     let mut paths = vec![];
     // Horizontal mortar lines.
-    let mut y = y0;
-    while y <= y1 + 1e-9 {
-        paths.push(Path::new(vec![Vec2d::new(x0, y), Vec2d::new(x1, y)]));
-        y += brick_h;
+    for k in k_start..=k_end {
+        let y = k as f64 * brick_h;
+        if y >= y0 - 1e-9 && y <= y1 + 1e-9 {
+            paths.push(Path::new(vec![Vec2d::new(x0, y), Vec2d::new(x1, y)]));
+        }
     }
-    // Vertical joints, alternating phase per row.
-    let mut row   = 0i64;
-    let mut y_top = y0;
-    while y_top < y1 - 1e-9 {
-        let phase = row.rem_euclid(2) as f64 * brick_w * 0.5;
+    // Vertical joints for each brick row.
+    for k in k_start..k_end {
+        let y_top = (k as f64 * brick_h).max(y0);
+        let y_bot = ((k + 1) as f64 * brick_h).min(y1);
+        if y_top >= y_bot - 1e-9 { continue; }
+        let phase = k.rem_euclid(2) as f64 * brick_w * 0.5;
         let col_start = ((x0 - phase) / brick_w).floor() as i64;
         let col_end   = ((x1 - phase) / brick_w).ceil()  as i64;
         for col in col_start..=col_end {
             let x = phase + col as f64 * brick_w;
             if x > x0 + 1e-9 && x < x1 - 1e-9 {
-                let y_bot = (y_top + brick_h).min(y1);
                 paths.push(Path::new(vec![Vec2d::new(x, y_top), Vec2d::new(x, y_bot)]));
             }
         }
-        y_top += brick_h;
-        row   += 1;
     }
     paths
 }
@@ -536,7 +564,8 @@ fn fill_rect_paths(x0: f64, y0: f64, x1: f64, y1: f64, fill: &FillSpec) -> Vec<P
             .collect(),
         FillKind::Dots       => dots_rect_paths(x0, y0, x1, y1, fill.spacing),
         FillKind::Zigzag     => zigzag_rect_paths(x0, y0, x1, y1, fill.spacing),
-        FillKind::Waves      => waves_rect_paths(x0, y0, x1, y1, fill.spacing),
+        FillKind::Waves { amplitude, wavelength, phase_step } =>
+            waves_rect_paths(x0, y0, x1, y1, fill.spacing, *amplitude, *wavelength, *phase_step),
         FillKind::Concentric => concentric_rect_paths(x0, y0, x1, y1, fill.spacing),
         FillKind::Hex        => hex_rect_paths(x0, y0, x1, y1, fill.spacing),
         FillKind::Brick      => brick_rect_paths(x0, y0, x1, y1, fill.spacing),
