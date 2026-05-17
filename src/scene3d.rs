@@ -114,6 +114,36 @@ pub mod presets {
                 octahedron   (Vec3::new( 4.0,  1.5, 0.5), 1.4),
                 dodecahedron (Vec3::new( 0.5,  3.5, 0.5), 1.4),
             ]},
+            "frame" => Scene { objects: vec![
+                // Frame at the front (closest to camera). Things behind should be visible
+                // through the hole.
+                frame  (Vec3::new( 0.0,  0.0,  2.0), 4.0, 2.0, 0.4),
+                cube   (Vec3::new(-1.5, -0.5, -1.5), 1.5),
+                sphere (Vec3::new( 1.0,  0.5, -1.0), 0.9, 16, 24),
+            ]},
+            "torus" => Scene { objects: vec![
+                polytorus(Vec3::zero(), 2.5, 0.9, 12, 6),
+            ]},
+            "torus-stack" => Scene { objects: vec![
+                polytorus(Vec3::new(0.0, 0.0, -1.5), 2.5, 0.7, 14, 6),
+                polytorus(Vec3::new(0.0, 0.0,  0.0), 2.0, 0.6,  8, 5),
+                polytorus(Vec3::new(0.0, 0.0,  1.5), 1.4, 0.5,  6, 4),
+            ]},
+            "knot" => Scene { objects: vec![
+                // Trefoil: 2 wraps around the torus axis × 3 around the tube.
+                // M=12 (cross-section subdivision) keeps lobe tips smooth — at lower M, the
+                // polygonal facets become silhouettes whenever the tube points nearly along view.
+                torus_knot(Vec3::zero(), 2.5, 0.7, 0.4, 2, 3, 90, 12),
+            ]},
+            "knot-5-2" => Scene { objects: vec![
+                // Pentafoil / Solomon's-seal-style 5-fold knot.
+                torus_knot(Vec3::zero(), 2.5, 0.6, 0.32, 2, 5, 130, 6),
+            ]},
+            "knot-tiny" => Scene { objects: vec![
+                // Minimal trefoil for debugging self-occlusion: 24 path segments × 4 around
+                // = 96 quads. Big enough to be a knot, small enough to inspect by hand.
+                torus_knot(Vec3::zero(), 2.5, 0.7, 0.5, 2, 3, 24, 4),
+            ]},
             "swarm" => {
                 let n = swarm_count.max(1);
                 // Scale extent with cube count^(1/3) so density stays roughly constant.
@@ -240,7 +270,9 @@ pub mod presets {
     }
 
     pub fn names() -> &'static [&'static str] {
-        &["showcase", "cubes", "tower", "mixed", "shapes", "swarm", "textured", "text", "text-swarm"]
+        &["showcase", "cubes", "tower", "mixed", "shapes", "frame",
+          "torus", "torus-stack", "knot", "knot-5-2", "knot-tiny",
+          "swarm", "textured", "text", "text-swarm"]
     }
 }
 
@@ -356,6 +388,10 @@ pub struct Mesh {
     pub faces:           Vec<[usize; 3]>,
     pub edges:           Vec<Edge>,
     pub textured_faces:  Vec<TexturedFace>,
+    /// When true, the renderer relies purely on front/back face culling for hidden-line
+    /// removal within this object — correct only for convex shapes. Set to false for
+    /// non-convex shapes so that per-triangle self-occlusion clipping kicks in.
+    pub assume_convex:   bool,
 }
 
 /// A flat patch on the mesh that carries a 2D texture (line-art paths).
@@ -384,13 +420,13 @@ impl TexturedFace {
 impl Mesh {
     pub fn new(vertices: Vec<Vec3>, faces: Vec<[usize; 3]>) -> Self {
         let edges = compute_edges(&vertices, &faces, /*crease threshold:*/ 0.6_f64.to_radians().cos());
-        Self { vertices, faces, edges, textured_faces: Vec::new() }
+        Self { vertices, faces, edges, textured_faces: Vec::new(), assume_convex: true }
     }
 
     /// Build with a custom crease angle threshold (in radians).
     pub fn with_crease_angle(vertices: Vec<Vec3>, faces: Vec<[usize; 3]>, crease_rad: f64) -> Self {
         let edges = compute_edges(&vertices, &faces, crease_rad.cos());
-        Self { vertices, faces, edges, textured_faces: Vec::new() }
+        Self { vertices, faces, edges, textured_faces: Vec::new(), assume_convex: true }
     }
 
     pub fn with_texture(mut self, face: TexturedFace) -> Self {
@@ -398,21 +434,194 @@ impl Mesh {
         self
     }
 
+    /// Mark this mesh as non-convex; render-time self-occlusion (per-triangle clipping)
+    /// will be applied. Slower per object but necessary for shapes with holes or concavities.
+    pub fn with_self_occlusion(mut self) -> Self {
+        self.assume_convex = false;
+        self
+    }
+
     /// Build a mesh from polygon faces. Each polygon is a list of vertex indices in
-    /// CCW order viewed from outside; polygons must be planar. Each polygon is
-    /// fan-triangulated from its first vertex. The internal triangulation diagonals
-    /// fall on coplanar adjacent triangles, so they're classified as smooth and
-    /// won't render — only the polygon's actual edges show up as creases.
+    /// CCW order viewed from outside. Polygons should be planar (small warps are
+    /// tolerated). Fan-triangulation diagonals are removed from the edge list entirely
+    /// — they're internal-only and should never be drawn, even at silhouette boundaries
+    /// where a warped quad's two fan triangles might numerically split between front
+    /// and back. Triangles themselves are kept so self-occlusion still works correctly.
     pub fn from_polygons(vertices: Vec<Vec3>, polygons: Vec<Vec<usize>>) -> Self {
+        use std::collections::HashSet;
         let mut faces: Vec<[usize; 3]> = Vec::new();
+        let mut fan_diagonals: HashSet<(usize, usize)> = HashSet::new();
         for poly in &polygons {
             if poly.len() < 3 { continue; }
             for i in 1..poly.len() - 1 {
                 faces.push([poly[0], poly[i], poly[i + 1]]);
+                if i >= 2 {
+                    let (a, b) = (poly[0].min(poly[i]), poly[0].max(poly[i]));
+                    fan_diagonals.insert((a, b));
+                }
             }
         }
-        Self::new(vertices, faces)
+        let mut mesh = Self::new(vertices, faces);
+        mesh.edges.retain(|e| {
+            let key = (e.a.min(e.b), e.a.max(e.b));
+            !fan_diagonals.contains(&key)
+        });
+        mesh
     }
+}
+
+/// A polygonal `(p, q)`-torus knot. The path winds around the torus's central axis `p` times
+/// and around the tube cross-section `q` times. Trefoil = (2, 3); pentafoil = (2, 5);
+/// gcd(p, q) > 1 yields one component of a torus link instead of a single connected knot.
+///
+/// Tube is built by sweeping an `n_around`-gon cross-section along the path with a
+/// parallel-transport frame; a single uniform rotation is distributed along the loop to
+/// close the holonomy gap so there's no visible seam at the wrap-around.
+pub fn torus_knot(
+    center:   Vec3,
+    major_r:  f64,
+    path_r:   f64,
+    tube_r:   f64,
+    p:        u32,
+    q:        u32,
+    n_along:  usize,
+    n_around: usize,
+) -> Mesh {
+    let n  = n_along.max(8);
+    let m  = n_around.max(3);
+    let pf = p as f64;
+    let qf = q as f64;
+
+    // Sample the knot center path.
+    let pts: Vec<Vec3> = (0..n).map(|i| {
+        let t = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
+        let (sp, cp) = (pf * t).sin_cos();
+        let (sq, cq) = (qf * t).sin_cos();
+        let radial = major_r + path_r * cq;
+        Vec3::new(radial * cp, radial * sp, path_r * sq)
+    }).collect();
+
+    // Tangents via central differences.
+    let tangents: Vec<Vec3> = (0..n).map(|i| {
+        let prev = pts[(i + n - 1) % n];
+        let next = pts[(i + 1) % n];
+        next.sub(prev).normalize()
+    }).collect();
+
+    // Parallel-transport an arbitrary normal along the path.
+    let initial_normal = {
+        let t    = tangents[0];
+        let cand = if t.x.abs() < 0.9 { Vec3::new(1.0, 0.0, 0.0) } else { Vec3::new(0.0, 1.0, 0.0) };
+        cand.sub(t.scale(t.dot(cand))).normalize()
+    };
+    let mut normals = Vec::with_capacity(n);
+    normals.push(initial_normal);
+    for i in 1..n {
+        let prev_n = normals[i - 1];
+        let t      = tangents[i];
+        normals.push(prev_n.sub(t.scale(prev_n.dot(t))).normalize());
+    }
+
+    // Compute and distribute the holonomy so the last frame's wrap matches the first.
+    let last_to_start = {
+        let t = tangents[0];
+        let proj = normals[n - 1].sub(t.scale(normals[n - 1].dot(t))).normalize();
+        let n0   = normals[0];
+        let dot  = proj.dot(n0).clamp(-1.0, 1.0);
+        let mag  = dot.acos();
+        let sign = t.dot(proj.cross(n0)).signum();
+        if sign == 0.0 { mag } else { mag * sign }
+    };
+    for i in 0..n {
+        let theta = -last_to_start * i as f64 / n as f64;
+        let (s, c) = theta.sin_cos();
+        let nrm = normals[i];
+        let t   = tangents[i];
+        let bin = t.cross(nrm).normalize();
+        normals[i] = nrm.scale(c).add(bin.scale(s));
+    }
+
+    // Generate vertices: a polygonal cross-section ring at each path point.
+    let mut v: Vec<Vec3> = Vec::with_capacity(n * m);
+    for i in 0..n {
+        let p_c   = pts[i];
+        let t     = tangents[i];
+        let nrm   = normals[i];
+        let bin   = t.cross(nrm).normalize();
+        for j in 0..m {
+            let phi = 2.0 * std::f64::consts::PI * j as f64 / m as f64;
+            let (sphi, cphi) = phi.sin_cos();
+            v.push(center.add(p_c.add(nrm.scale(tube_r * cphi)).add(bin.scale(tube_r * sphi))));
+        }
+    }
+
+    let idx = |i: usize, j: usize| (i % n) * m + (j % m);
+    let mut polygons: Vec<Vec<usize>> = Vec::with_capacity(n * m);
+    for i in 0..n {
+        for j in 0..m {
+            polygons.push(vec![idx(i, j), idx(i + 1, j), idx(i + 1, j + 1), idx(i, j + 1)]);
+        }
+    }
+    Mesh::from_polygons(v, polygons).with_self_occlusion()
+}
+
+/// A polygonal torus (donut): `major_r` is the distance from the torus center to the tube
+/// center, `minor_r` is the tube radius. `major_segs` and `minor_segs` control how many
+/// flat polygon faces the donut is built from (low values = chunky/faceted look).
+pub fn polytorus(center: Vec3, major_r: f64, minor_r: f64, major_segs: usize, minor_segs: usize) -> Mesh {
+    let n = major_segs.max(3);
+    let m = minor_segs.max(3);
+    let mut v: Vec<Vec3> = Vec::with_capacity(n * m);
+    for i in 0..n {
+        let theta = 2.0 * std::f64::consts::PI * i as f64 / n as f64;
+        let (st, ct) = theta.sin_cos();
+        for j in 0..m {
+            let phi = 2.0 * std::f64::consts::PI * j as f64 / m as f64;
+            let (sp, cp) = phi.sin_cos();
+            let radial = major_r + minor_r * cp;
+            v.push(center.add(Vec3::new(radial * ct, radial * st, minor_r * sp)));
+        }
+    }
+    let idx = |i: usize, j: usize| (i % n) * m + (j % m);
+    let mut polygons: Vec<Vec<usize>> = Vec::with_capacity(n * m);
+    for i in 0..n {
+        for j in 0..m {
+            polygons.push(vec![idx(i, j), idx(i + 1, j), idx(i + 1, j + 1), idx(i, j + 1)]);
+        }
+    }
+    Mesh::from_polygons(v, polygons).with_self_occlusion()
+}
+
+/// A square picture-frame shape: outer square minus inner square hole, extruded by `depth`.
+/// `outer` and `inner` are the side lengths of the two squares (inner < outer).
+/// This is a non-convex shape with a topological hole — exercises multi-loop silhouette extraction.
+pub fn frame(center: Vec3, outer: f64, inner: f64, depth: f64) -> Mesh {
+    let o = outer * 0.5;
+    let i = inner * 0.5;
+    let h = depth * 0.5;
+    let v: Vec<Vec3> = vec![
+        // 0..3   outer SW, SE, NE, NW front (z = +h)
+        Vec3::new(-o,-o, h), Vec3::new( o,-o, h), Vec3::new( o, o, h), Vec3::new(-o, o, h),
+        // 4..7   inner SW, SE, NE, NW front
+        Vec3::new(-i,-i, h), Vec3::new( i,-i, h), Vec3::new( i, i, h), Vec3::new(-i, i, h),
+        // 8..11  outer SW, SE, NE, NW back  (z = -h)
+        Vec3::new(-o,-o,-h), Vec3::new( o,-o,-h), Vec3::new( o, o,-h), Vec3::new(-o, o,-h),
+        // 12..15 inner SW, SE, NE, NW back
+        Vec3::new(-i,-i,-h), Vec3::new( i,-i,-h), Vec3::new( i, i,-h), Vec3::new(-i, i,-h),
+    ].into_iter().map(|p| p.add(center)).collect();
+    let mut polygons = Vec::with_capacity(16);
+    for s in 0..4 {
+        let s1 = (s + 1) % 4;
+        // Front annulus strip — outward +z.
+        polygons.push(vec![s, s1, 4 + s1, 4 + s]);
+        // Back annulus strip  — outward -z (reversed winding).
+        polygons.push(vec![8 + s1, 8 + s, 12 + s, 12 + s1]);
+        // Outer side wall — outward radially outward.
+        polygons.push(vec![s, 8 + s, 8 + s1, s1]);
+        // Inner side wall (tunnel wall) — outward INTO the hole.
+        polygons.push(vec![4 + s, 4 + s1, 12 + s1, 12 + s]);
+    }
+    Mesh::from_polygons(v, polygons).with_self_occlusion()
 }
 
 /// A simple house shape: a 2×2×1 box with a gabled roof on top.
@@ -809,10 +1018,11 @@ pub struct Scene {
 struct Projected<'a> {
     mesh:        &'a Mesh,
     verts2d:     Vec<(f64, f64)>,
+    depths:      Vec<f64>,     // view-space depth per vertex
     front:       Vec<bool>,    // per face
-    silhouette:  Vec<(f64, f64)>, // closed 2D polygon (may be empty if shape is fully back-facing)
-    sil_bbox:    (f64, f64, f64, f64), // (min_x, min_y, max_x, max_y) of silhouette polygon
-    depth:       f64,          // representative depth
+    silhouette:  Vec<Vec<(f64, f64)>>, // one or more closed 2D loops (polygon-with-holes)
+    sil_bbox:    (f64, f64, f64, f64), // (min_x, min_y, max_x, max_y) over all loops
+    depth:       f64,          // representative depth (mean of vertex depths)
 }
 
 pub fn render(scene: &Scene, camera: &Camera) -> Vec<Path<f64>> {
@@ -824,6 +1034,22 @@ pub fn render(scene: &Scene, camera: &Camera) -> Vec<Path<f64>> {
 
     for (i, p) in projected.iter().enumerate() {
         let mut segments: Vec<((f64, f64), (f64, f64))> = Vec::new();
+
+        // Pass 1: collect visible mesh edges. For non-convex meshes, apply Appel's
+        // Quantitative Invisibility (QI) for self-occlusion.
+        let do_self_occlusion = !p.mesh.assume_convex;
+        // Precompute silhouette edges (front/back boundary) for QI — only where the
+        // facing switches, which is where QI changes as we trace along an edge.
+        let sil_for_qi: Vec<(usize, usize, usize)> = if do_self_occlusion {
+            p.mesh.edges.iter().filter_map(|e| {
+                let f0 = e.faces[0].map(|f| p.front[f]).unwrap_or(false);
+                let f1 = e.faces[1].map(|f| p.front[f]).unwrap_or(false);
+                if f0 == f1 { return None; }
+                let fi = if f0 { e.faces[0].unwrap() } else { e.faces[1].unwrap() };
+                Some((e.a, e.b, fi))
+            }).collect()
+        } else { Vec::new() };
+
         for e in &p.mesh.edges {
             let visible = match e.kind {
                 EdgeKind::Crease => {
@@ -840,12 +1066,27 @@ pub fn render(scene: &Scene, camera: &Camera) -> Vec<Path<f64>> {
                     e.faces[0].map(|f| p.front[f]).unwrap_or(false)
                 }
             };
-            if visible {
-                if let Some(seg) = camera.project_segment(p.mesh.vertices[e.a], p.mesh.vertices[e.b]) {
-                    segments.push(seg);
-                }
+            if !visible { continue; }
+            let seg = match camera.project_segment(p.mesh.vertices[e.a], p.mesh.vertices[e.b]) {
+                Some(s) => s,
+                None    => continue,
+            };
+
+            if !do_self_occlusion {
+                segments.push(seg);
+                continue;
+            }
+
+            // Self-occlusion via Appel's Quantitative Invisibility:
+            // compute initial QI at edge start, track QI changes at silhouette crossings,
+            // emit only QI=0 sub-segments.
+            let ea = (seg.0.0, seg.0.1, p.depths[e.a]);
+            let eb = (seg.1.0, seg.1.1, p.depths[e.b]);
+            for s in appel_qi_segments(ea, eb, &sil_for_qi, &p.mesh.faces, &p.front, &p.verts2d, &p.depths) {
+                segments.push(s);
             }
         }
+
         // Textured faces: emit paths if the face is front-facing (normal points toward camera).
         for tex in &p.mesh.textured_faces {
             // Front-facing: outward normal points toward eye for any face centroid.
@@ -865,7 +1106,7 @@ pub fn render(scene: &Scene, camera: &Camera) -> Vec<Path<f64>> {
         // Clip against all closer objects' silhouettes. Quick segment-bbox vs silhouette-bbox
         // overlap test skips the polygon clip when they can't possibly intersect.
         for (j, q) in projected.iter().enumerate() {
-            if i == j || q.depth >= p.depth || q.silhouette.len() < 3 { continue; }
+            if i == j || q.depth >= p.depth || q.silhouette.is_empty() { continue; }
             let (qx0, qy0, qx1, qy1) = q.sil_bbox;
             segments = segments.into_iter().flat_map(|s| {
                 let s_x0 = s.0.0.min(s.1.0);
@@ -875,7 +1116,7 @@ pub fn render(scene: &Scene, camera: &Camera) -> Vec<Path<f64>> {
                 if s_x1 < qx0 || s_x0 > qx1 || s_y1 < qy0 || s_y0 > qy1 {
                     vec![s] // bboxes disjoint — segment passes through unchanged
                 } else {
-                    clip_segment_against_polygon(s, &q.silhouette)
+                    clip_segment_against_loops(s, &q.silhouette)
                 }
             }).collect();
         }
@@ -910,7 +1151,7 @@ fn project<'a>(mesh: &'a Mesh, cam: &Camera) -> Projected<'a> {
     // If any vertex is behind near, the projected hull would balloon to infinity, so we'd rather
     // skip this object's silhouette (no occlusion against farther objects) than emit a wrong polygon.
     let any_behind = depths.iter().any(|&d| d < cam.near);
-    let silhouette = if any_behind { Vec::new() } else { convex_hull_2d(&verts2d) };
+    let silhouette = if any_behind { Vec::new() } else { build_silhouette_loops(mesh, &front, &verts2d) };
     let depth      = depths.iter().sum::<f64>() / depths.len().max(1) as f64;
 
     let sil_bbox = if silhouette.is_empty() {
@@ -918,64 +1159,99 @@ fn project<'a>(mesh: &'a Mesh, cam: &Camera) -> Projected<'a> {
     } else {
         let mut bx0 = f64::INFINITY; let mut bx1 = f64::NEG_INFINITY;
         let mut by0 = f64::INFINITY; let mut by1 = f64::NEG_INFINITY;
-        for &(x, y) in &silhouette {
-            if x < bx0 { bx0 = x; } if x > bx1 { bx1 = x; }
-            if y < by0 { by0 = y; } if y > by1 { by1 = y; }
+        for loop_v in &silhouette {
+            for &(x, y) in loop_v {
+                if x < bx0 { bx0 = x; } if x > bx1 { bx1 = x; }
+                if y < by0 { by0 = y; } if y > by1 { by1 = y; }
+            }
         }
         (bx0, by0, bx1, by1)
     };
 
-    Projected { mesh, verts2d, front, silhouette, sil_bbox, depth }
+    Projected { mesh, verts2d, depths, front, silhouette, sil_bbox, depth }
 }
 
-/// 2D convex hull of all projected vertices, via Andrew's monotone chain.
-/// For convex 3D shapes the projected silhouette is the convex hull of the
-/// projected vertex cloud — robust and topology-free.
-fn convex_hull_2d(pts: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    if pts.len() < 3 { return pts.to_vec(); }
-    let mut sorted: Vec<(f64, f64)> = pts.to_vec();
-    sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap().then(a.1.partial_cmp(&b.1).unwrap()));
-    sorted.dedup_by(|a, b| (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9);
-    if sorted.len() < 3 { return sorted; }
-
-    let cross_3 = |o: (f64, f64), a: (f64, f64), b: (f64, f64)| -> f64 {
-        (a.0 - o.0) * (b.1 - o.1) - (a.1 - o.1) * (b.0 - o.0)
-    };
-
-    let mut hull: Vec<(f64, f64)> = Vec::with_capacity(sorted.len() * 2);
-    // Lower hull
-    for &p in &sorted {
-        while hull.len() >= 2 && cross_3(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
-            hull.pop();
-        }
-        hull.push(p);
+/// Walk silhouette edges (front face on one side, back on the other) into one or more
+/// closed loops. For convex shapes this gives a single loop = the projected outline.
+/// For shapes with holes (genus > 0), or non-convex outlines, multiple loops result.
+/// The polygon-with-holes is later interpreted with the even-odd fill rule.
+fn build_silhouette_loops(
+    mesh: &Mesh,
+    front: &[bool],
+    verts2d: &[(f64, f64)],
+) -> Vec<Vec<(f64, f64)>> {
+    let mut sil_edges: Vec<(usize, usize)> = Vec::new();
+    for e in &mesh.edges {
+        let f0 = e.faces[0].map(|f| front[f]).unwrap_or(false);
+        let f1 = e.faces[1].map(|f| front[f]).unwrap_or(false);
+        if f0 != f1 { sil_edges.push((e.a, e.b)); }
     }
-    let lower = hull.len() + 1;
-    // Upper hull
-    for &p in sorted.iter().rev().skip(1) {
-        while hull.len() >= lower && cross_3(hull[hull.len() - 2], hull[hull.len() - 1], p) <= 0.0 {
-            hull.pop();
-        }
-        hull.push(p);
+    if sil_edges.is_empty() { return Vec::new(); }
+
+    let mut adj: HashMap<usize, Vec<usize>> = HashMap::new();
+    for &(a, b) in &sil_edges {
+        adj.entry(a).or_default().push(b);
+        adj.entry(b).or_default().push(a);
     }
-    hull.pop(); // last == first
-    hull
+
+    use std::collections::HashSet;
+    let edge_key = |a: usize, b: usize| if a < b { (a, b) } else { (b, a) };
+    let mut visited: HashSet<(usize, usize)> = HashSet::new();
+    let mut loops: Vec<Vec<(f64, f64)>> = Vec::new();
+
+    for &(start_a, start_b) in &sil_edges {
+        let key = edge_key(start_a, start_b);
+        if visited.contains(&key) { continue; }
+        visited.insert(key);
+
+        let mut loop_v = vec![start_a];
+        let mut prev = start_a;
+        let mut cur  = start_b;
+        loop {
+            loop_v.push(cur);
+            if cur == start_a { break; }
+            let nbrs = match adj.get(&cur) { Some(n) => n, None => break };
+            // Prefer an unvisited neighbor that isn't `prev` (continues the loop).
+            let next = nbrs.iter().copied().find(|&nv| nv != prev && !visited.contains(&edge_key(cur, nv)))
+                .or_else(|| nbrs.iter().copied().find(|&nv| !visited.contains(&edge_key(cur, nv))));
+            match next {
+                None => break,
+                Some(nv) => {
+                    visited.insert(edge_key(cur, nv));
+                    prev = cur;
+                    cur  = nv;
+                }
+            }
+            if loop_v.len() > sil_edges.len() + 4 { break; } // safety
+        }
+        // Drop the duplicate closing vertex if the loop closed back to start.
+        if loop_v.len() >= 2 && *loop_v.last().unwrap() == loop_v[0] { loop_v.pop(); }
+        if loop_v.len() >= 3 {
+            loops.push(loop_v.into_iter().map(|i| verts2d[i]).collect());
+        }
+    }
+    loops
 }
 
 // ── 2D clipping helpers ────────────────────────────────────────────────────
 
-fn clip_segment_against_polygon(
-    seg:  ((f64, f64), (f64, f64)),
-    poly: &[(f64, f64)],
+/// Clip a 2D segment against a polygon-with-holes (multi-loop), using even-odd fill rule.
+/// Returns the parts of the segment that are *outside* the filled region.
+fn clip_segment_against_loops(
+    seg:   ((f64, f64), (f64, f64)),
+    loops: &[Vec<(f64, f64)>],
 ) -> Vec<((f64, f64), (f64, f64))> {
-    if poly.len() < 3 { return vec![seg]; }
+    if loops.is_empty() || loops.iter().all(|l| l.len() < 3) { return vec![seg]; }
     let (s, e) = seg;
     let mut ts: Vec<f64> = vec![0.0, 1.0];
-    for i in 0..poly.len() {
-        let p1 = poly[i];
-        let p2 = poly[(i + 1) % poly.len()];
-        if let Some(t) = segment_intersection_t(s, e, p1, p2) {
-            if t > 1e-9 && t < 1.0 - 1e-9 { ts.push(t); }
+    for loop_v in loops {
+        if loop_v.len() < 2 { continue; }
+        for i in 0..loop_v.len() {
+            let p1 = loop_v[i];
+            let p2 = loop_v[(i + 1) % loop_v.len()];
+            if let Some(t) = segment_intersection_t(s, e, p1, p2) {
+                if t > 1e-9 && t < 1.0 - 1e-9 { ts.push(t); }
+            }
         }
     }
     ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -986,7 +1262,7 @@ fn clip_segment_against_polygon(
         if t1 - t0 < 1e-9 { continue; }
         let mid_t = 0.5 * (t0 + t1);
         let mid = (s.0 + (e.0 - s.0) * mid_t, s.1 + (e.1 - s.1) * mid_t);
-        if !point_in_polygon(mid, poly) {
+        if !point_in_loops(mid, loops) {
             let p0 = (s.0 + (e.0 - s.0) * t0, s.1 + (e.1 - s.1) * t0);
             let p1 = (s.0 + (e.0 - s.0) * t1, s.1 + (e.1 - s.1) * t1);
             out.push((p0, p1));
@@ -1008,6 +1284,158 @@ fn segment_intersection_t(a: (f64, f64), b: (f64, f64), c: (f64, f64), d: (f64, 
     Some(t.clamp(0.0, 1.0))
 }
 
+/// Appel's Quantitative Invisibility self-occlusion for one edge.
+///
+/// `ea`/`eb`: (x2d, y2d, depth) at the edge's start and end.
+/// `sil`: silhouette edges of the same mesh — (vertex_a, vertex_b, front_face_idx).
+///        QI changes by ±1 each time the edge crosses one of these in 2D (if the
+///        silhouette edge is in front of the test edge at the crossing).
+///
+/// Returns the QI=0 (visible) sub-segments.
+fn appel_qi_segments(
+    ea: (f64, f64, f64),
+    eb: (f64, f64, f64),
+    sil: &[(usize, usize, usize)],
+    faces: &[[usize; 3]],
+    front: &[bool],
+    verts2d: &[(f64, f64)],
+    depths: &[f64],
+) -> Vec<((f64, f64), (f64, f64))> {
+    // ── Step 1: initial QI at edge start ─────────────────────────────────────
+    // Count front-facing triangles whose 2D projection covers ea AND that are
+    // clearly closer to the camera (depth < ea.2).  Co-surface triangles are
+    // at the same depth as ea, so the 1e-4 guard excludes them.
+    let mut qi: i32 = 0;
+    {
+        let pt = (ea.0, ea.1);
+        for (ti, tri) in faces.iter().enumerate() {
+            if !front[ti] { continue; }
+            let tv = [verts2d[tri[0]], verts2d[tri[1]], verts2d[tri[2]]];
+            // bbox pre-filter
+            if pt.0 < tv[0].0.min(tv[1].0).min(tv[2].0) { continue; }
+            if pt.0 > tv[0].0.max(tv[1].0).max(tv[2].0) { continue; }
+            if pt.1 < tv[0].1.min(tv[1].1).min(tv[2].1) { continue; }
+            if pt.1 > tv[0].1.max(tv[1].1).max(tv[2].1) { continue; }
+            if !point_in_triangle(pt, &tv) { continue; }
+            let td = [depths[tri[0]], depths[tri[1]], depths[tri[2]]];
+            let denom = (tv[1].1 - tv[2].1) * (tv[0].0 - tv[2].0)
+                      + (tv[2].0 - tv[1].0) * (tv[0].1 - tv[2].1);
+            if denom.abs() < 1e-9 { continue; }
+            let tri_d = barycentric_depth(pt, &tv, &td);
+            if tri_d < ea.2 - 1e-4 { qi += 1; }
+        }
+    }
+
+    // ── Step 2: silhouette crossings along E ─────────────────────────────────
+    // For each silhouette edge S that crosses E in 2D and is in front of E at
+    // the crossing, QI changes by ±1 depending on which side of S the front face is on.
+    let e_dir = (eb.0 - ea.0, eb.1 - ea.1);
+    let mut events: Vec<(f64, i32)> = Vec::new();
+    for &(va, vb, fi) in sil {
+        let sa = verts2d[va];
+        let sb = verts2d[vb];
+        let s_dir = (sb.0 - sa.0, sb.1 - sa.1);
+
+        // 2D intersection: E at parameter t, S at parameter u.
+        let denom = e_dir.0 * s_dir.1 - e_dir.1 * s_dir.0;
+        if denom.abs() < 1e-12 { continue; }
+        let diff = (sa.0 - ea.0, sa.1 - ea.1);
+        let t = (diff.0 * s_dir.1 - diff.1 * s_dir.0) / denom;
+        let u = (diff.0 * e_dir.1 - diff.1 * e_dir.0) / denom;
+        if t <= 1e-9 || t >= 1.0 - 1e-9 { continue; }  // outside E
+        if u < -1e-9 || u > 1.0 + 1e-9  { continue; }  // outside S
+
+        // Depth check: S must be in front of E at this crossing point.
+        let de = ea.2 + (eb.2 - ea.2) * t;
+        let ds = depths[va] + (depths[vb] - depths[va]) * u;
+        if ds >= de - 1e-4 { continue; }  // S is behind or co-depth with E
+
+        // Sign: which side of S is the front-facing face on?
+        // fc_side > 0 → front face is to the LEFT of S (when walking sa → sb).
+        let f = faces[fi];
+        let fc = (
+            (verts2d[f[0]].0 + verts2d[f[1]].0 + verts2d[f[2]].0) / 3.0,
+            (verts2d[f[0]].1 + verts2d[f[1]].1 + verts2d[f[2]].1) / 3.0,
+        );
+        let to_fc  = (fc.0 - sa.0, fc.1 - sa.1);
+        let fc_side = s_dir.0 * to_fc.1 - s_dir.1 * to_fc.0;
+        if fc_side.abs() < 1e-9 { continue; }  // degenerate: centroid on S line
+
+        // denom = cross(e_dir, s_dir).
+        // denom > 0 → E crosses S from left to right (relative to S direction).
+        // Entering front-face side → QI++; leaving → QI--.
+        let delta: i32 = if (denom > 0.0) == (fc_side > 0.0) { -1 } else { 1 };
+        events.push((t, delta));
+    }
+    events.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+
+    // ── Step 3: emit QI=0 segments ───────────────────────────────────────────
+    let lerp = |t: f64| -> (f64, f64) {
+        (ea.0 + (eb.0 - ea.0) * t, ea.1 + (eb.1 - ea.1) * t)
+    };
+    let mut result = Vec::new();
+    let mut prev_t = 0.0_f64;
+    for (t, delta) in events {
+        if t > prev_t + 1e-9 && qi == 0 {
+            result.push((lerp(prev_t), lerp(t)));
+        }
+        qi += delta;
+        qi = qi.max(0); // clamp: QI should never underflow, but guard against fp noise
+        prev_t = t;
+    }
+    if 1.0 - prev_t > 1e-9 && qi == 0 {
+        result.push((lerp(prev_t), lerp(1.0)));
+    }
+    result
+}
+
+fn point_in_triangle(p: (f64, f64), tri: &[(f64, f64); 3]) -> bool {
+    let sign = |a: (f64, f64), b: (f64, f64), c: (f64, f64)| -> f64 {
+        (a.0 - c.0) * (b.1 - c.1) - (b.0 - c.0) * (a.1 - c.1)
+    };
+    let d1 = sign(p, tri[0], tri[1]);
+    let d2 = sign(p, tri[1], tri[2]);
+    let d3 = sign(p, tri[2], tri[0]);
+    let has_neg = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_pos = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_neg && has_pos)
+}
+
+fn barycentric_depth(p: (f64, f64), tri: &[(f64, f64); 3], depths: &[f64; 3]) -> f64 {
+    let (x, y)   = p;
+    let (x1, y1) = tri[0];
+    let (x2, y2) = tri[1];
+    let (x3, y3) = tri[2];
+    let denom = (y2 - y3) * (x1 - x3) + (x3 - x2) * (y1 - y3);
+    if denom.abs() < 1e-12 {
+        return (depths[0] + depths[1] + depths[2]) / 3.0;
+    }
+    let w1 = ((y2 - y3) * (x - x3) + (x3 - x2) * (y - y3)) / denom;
+    let w2 = ((y3 - y1) * (x - x3) + (x1 - x3) * (y - y3)) / denom;
+    let w3 = 1.0 - w1 - w2;
+    w1 * depths[0] + w2 * depths[1] + w3 * depths[2]
+}
+
+/// Even-odd point-in-polygon for a polygon-with-holes (multiple loops).
+fn point_in_loops(p: (f64, f64), loops: &[Vec<(f64, f64)>]) -> bool {
+    let mut crossings = 0usize;
+    for loop_v in loops {
+        let n = loop_v.len();
+        if n < 2 { continue; }
+        let mut j = n - 1;
+        for i in 0..n {
+            let (xi, yi) = loop_v[i];
+            let (xj, yj) = loop_v[j];
+            if (yi > p.1) != (yj > p.1) && p.0 < (xj - xi) * (p.1 - yi) / (yj - yi) + xi {
+                crossings += 1;
+            }
+            j = i;
+        }
+    }
+    crossings & 1 == 1
+}
+
+#[allow(dead_code)]
 fn point_in_polygon(p: (f64, f64), poly: &[(f64, f64)]) -> bool {
     let mut inside = false;
     let n = poly.len();
