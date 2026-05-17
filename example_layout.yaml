@@ -1,0 +1,9 @@
+{
+  "text": [
+    {font: "FUTURAL",  size: 1.0,  text: "PLOTHOLE",     pos: [0,   0]},
+    {font: "FUTURAL",  size: 0.6,  text: "text layout",  pos: [2,  28]},
+    {font: "ROWMANS",  size: 1.2,  text: "Hello World",  pos: [0,  60]},
+    {font: "SCRIPTC",  size: 0.8,  text: "pen plotter",  pos: [4,  95]},
+    {font: "IOSEVKA",  size: 18,   text: "code font",    pos: [0, 130]}
+  ]
+}
